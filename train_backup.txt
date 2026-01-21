@@ -1,0 +1,190 @@
+import torch
+import torch.optim as optim
+import yaml
+import os
+import numpy as np
+from tqdm import tqdm
+from torch.utils.data import DataLoader
+from torch_geometric.data import Batch
+# import wandb  # [보류] WandB 사용 시 주석 해제
+
+# Project Imports
+from src.dataset import get_selected_dataset
+from src.model import ST_HGAT
+from src.utils import build_graph
+from src.loss import SelfSupervisedLoss
+
+# ==============================================================================
+# [설정] Noise Injection Parameters
+# ==============================================================================
+NOISE_STD_LIDAR = 0.05  
+NOISE_STD_RADAR = 0.20 
+# ==============================================================================
+
+def custom_collate(batch):
+    hetero_data_list = [item[0] for item in batch]
+    gt_l = [item[1] for item in batch]
+    gt_r1 = [item[2] for item in batch]
+    gt_r2 = [item[3] for item in batch]
+    batched_hetero = Batch.from_data_list(hetero_data_list)
+    return batched_hetero, gt_l, gt_r1, gt_r2
+
+def train():
+    # 1. Config Load
+    config_path = "config/params.yaml"
+    with open(config_path, "r") as f: cfg = yaml.safe_load(f)
+
+    device = torch.device(cfg.get('device', 'cuda' if torch.cuda.is_available() else 'cpu'))
+    
+    if not os.path.exists(cfg['save_dir']):
+        os.makedirs(cfg['save_dir'])
+
+    # [보류] WandB 초기화
+    # wandb.init(project="SensorFusion_ST_HGAT", config=cfg)
+    # wandb.run.name = f"Train_{cfg['train_versions']}_Val_{cfg['val_versions']}"
+
+    # 2. Dataset Setup
+    print(f"[Data] Loading Train Versions: {cfg['train_versions']}")
+    train_dataset = get_selected_dataset(cfg['data_root'], cfg['train_versions'], cfg['window_size'])
+    train_loader = DataLoader(
+        train_dataset, 
+        batch_size=cfg['batch_size'], 
+        shuffle=True, 
+        collate_fn=custom_collate,
+        num_workers=8,       
+        pin_memory=True,     
+        persistent_workers=True 
+    )
+
+    print(f"[Data] Loading Validation Versions: {cfg['val_versions']}")
+    val_dataset = get_selected_dataset(cfg['data_root'], cfg['val_versions'], cfg['window_size'])
+    val_loader = DataLoader(
+        val_dataset, 
+        batch_size=cfg['batch_size'], 
+        shuffle=False, 
+        collate_fn=custom_collate,
+        num_workers=4,       
+        pin_memory=True
+    )
+    
+    # 3. Model
+    model = ST_HGAT(hidden_dim=cfg['hidden_dim'], num_layers=cfg['num_layers'], heads=cfg['num_heads']).to(device)
+    
+    # [보류] WandB Watch
+    # wandb.watch(model, log="all")
+
+    lr = float(cfg.get('lr', 0.001)) 
+    weight_decay = float(cfg.get('weight_decay', 1e-4))
+    
+    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
+
+    # 4. Loss Initialization
+    criterion = SelfSupervisedLoss(device=device, min_sigma=3e-2, dist_threshold=0.5).to(device)
+
+    print(f"[Train] Start with Noise -> Radar: {NOISE_STD_RADAR}m, LiDAR: {NOISE_STD_LIDAR}m")
+    
+    best_val_loss = float('inf')
+    patience = cfg.get('patience', 10)
+    counter = 0
+
+    # 5. Training Loop
+    for epoch in range(cfg['epochs']):
+        # --- [Training Phase] ---
+        model.train()
+        total_train_loss = 0.0
+        
+        loop = tqdm(train_loader, desc=f"Epoch {epoch+1}/{cfg['epochs']} [Train]")
+        
+        for batch in loop:
+            batch_data = batch[0].to(device)
+            gt_l = torch.cat([g.to(device) for g in batch[1]], dim=0)
+            gt_r1 = torch.cat([g.to(device) for g in batch[2]], dim=0)
+            gt_r2 = torch.cat([g.to(device) for g in batch[3]], dim=0)
+
+            # Noise Injection
+            noise_r1 = torch.randn_like(batch_data['radar1'].pos) * NOISE_STD_RADAR
+            noise_r2 = torch.randn_like(batch_data['radar2'].pos) * NOISE_STD_RADAR
+            batch_data['radar1'].pos += noise_r1
+            batch_data['radar2'].pos += noise_r2
+            noise_l = torch.randn_like(batch_data['lidar'].pos) * NOISE_STD_LIDAR
+            batch_data['lidar'].pos += noise_l
+
+            edge_index_dict = build_graph(
+                batch_data, cfg['radius_ll'], cfg['radius_rr'], cfg['radius_cross'], device
+            )
+
+            optimizer.zero_grad()
+            mu_l, log_l, mu_r1, log_r1, mu_r2, log_r2 = model(batch_data.x_dict, edge_index_dict)
+
+            loss, _, _, _ = criterion(
+                mu_l, log_l, gt_l,
+                mu_r1, log_r1, gt_r1, batch_data['radar1'].pos, 
+                mu_r2, log_r2, gt_r2, batch_data['radar2'].pos
+            )
+
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+
+            total_train_loss += loss.item()
+            loop.set_postfix(train_loss=loss.item())
+
+        avg_train_loss = total_train_loss / len(train_loader)
+
+        # --- [Validation Phase] ---
+        model.eval()
+        total_val_loss = 0.0
+        
+        with torch.no_grad():
+            for batch in val_loader:
+                batch_data = batch[0].to(device)
+                gt_l = torch.cat([g.to(device) for g in batch[1]], dim=0)
+                gt_r1 = torch.cat([g.to(device) for g in batch[2]], dim=0)
+                gt_r2 = torch.cat([g.to(device) for g in batch[3]], dim=0)
+
+                edge_index_dict = build_graph(
+                    batch_data, cfg['radius_ll'], cfg['radius_rr'], cfg['radius_cross'], device
+                )
+                
+                mu_l, log_l, mu_r1, log_r1, mu_r2, log_r2 = model(batch_data.x_dict, edge_index_dict)
+
+                loss, _, _, _ = criterion(
+                    mu_l, log_l, gt_l,
+                    mu_r1, log_r1, gt_r1, batch_data['radar1'].pos, 
+                    mu_r2, log_r2, gt_r2, batch_data['radar2'].pos
+                )
+                total_val_loss += loss.item()
+
+        avg_val_loss = total_val_loss / len(val_loader)
+        
+        # --- [Logging] ---
+        current_lr = optimizer.param_groups[0]['lr']
+        print(f"Epoch {epoch+1} Done. | Train: {avg_train_loss:.4f} | Val: {avg_val_loss:.4f}")
+        
+        # [보류] WandB Log
+        # wandb.log({
+        #     "Loss/Train": avg_train_loss,
+        #     "Loss/Validation": avg_val_loss,
+        #     "Parameters/Learning_Rate": current_lr
+        # }, step=epoch)
+        
+        scheduler.step(avg_val_loss)
+
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            counter = 0
+            torch.save(model.state_dict(), os.path.join(cfg['save_dir'], "best_model.pth"))
+            print(f"[*] Best Model Saved (Val Loss: {best_val_loss:.4f})")
+        else:
+            counter += 1
+            print(f"[!] No Improvement. Patience: {counter}/{patience}")
+            if counter >= patience:
+                print(f"[Stop] Early Stopping Triggered at Epoch {epoch+1}")
+                break
+
+    # [보류] WandB Finish
+    # wandb.finish()
+
+if __name__ == "__main__":
+    train()

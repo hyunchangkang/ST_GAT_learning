@@ -1,0 +1,25 @@
+# --- Research & Experiment Logs ---
+# Weights & Biases logs
+wandb/
+
+# --- Python & Cache ---
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# --- Model Checkpoints & Outputs ---
+# User defined checkpoint folders
+checkpoint_candidate/
+output/
+
+# Common model weight extensions
+*.pth
+*.pt
+*.ckpt
+*.h5
+*.pb
+
+# --- Environment & Data ---
+# Temporary training logs or backup files
+*.log

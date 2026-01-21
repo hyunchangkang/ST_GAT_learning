@@ -1,0 +1,84 @@
+# [Project Configuration]
+
+# 1. Data Selection
+
+# v1 로봇정지 사람 왔다갔다
+# v2 A->C 멀어지는 사람 2명
+# v3 C->A 다가오는 사람 1명/멀어지는 사람 2명
+# v4 A->C 다가오는 사람 1명/멀어지는 사람 1명
+# v5 로봇 정지 횡방향 사람
+# v6 로봇 S자주행
+# v7 로봇 S자주행 멀어지는 사람 1명
+# v8 A->C 사람x
+# v9 로봇직진 사람 왔다갔다
+# v10 C->A 로봇직진 사람 왔다갔다 사람 1명 벽에  붙어서 다가옴
+# v11 A’->A 로봇직진 사람 왔다갔다
+# v12 A’-> A 로봇직진 사람 왔다갔다
+# v13 A’-> A 로봇직진 사람 왔다갔다
+# v14 A-> A’ 로봇직진 사람 왔다갔다
+
+data_root: "/mnt/samsung_ssd/hyunchang/data_v2"             # 데이터 폴더 루트
+
+target_versions:
+  - "v1"
+  - "v2"
+  - "v3"
+  - "v4"
+  - "v5"
+  - "v6"
+  - "v7"
+  - "v8"
+  - "v9"
+  - "v10"
+  - "v11"
+  - "v12"
+  - "v13"
+  - "v14"
+
+train_versions:  
+  - "v1"
+  - "v2"
+  # - "v3"
+  # - "v4"
+  - "v5"
+  - "v6"
+  - "v7"
+  - "v8"
+  - "v9"
+  - "v10"
+  - "v11"
+  - "v12"
+  # - "v13"
+  - "v14"
+
+val_versions:    
+  - "v3"
+  - "v13"
+
+inference_version: "v4"
+
+model_path: "output/best_model.pth"  # 로드할 모델 경로 (best_model 사용 권장)
+
+# 2. Model Hyperparameters
+window_size: 4        # 과거 4프레임 참조 (t-4 ~ t-1)
+hidden_dim: 64        # 임베딩 차원
+num_heads: 4          # Multi-head Attention 개수
+num_layers: 3         # GNN 레이어 개수
+
+# 3. Graph Construction (Radius)
+radius_ll: 0.15        # LiDAR-LiDAR
+radius_rr: 1.0        # Radar-Radar
+radius_cross: 0.5     # Fusion
+
+# Temporal Radius
+temporal_radius_ll: 0.15  
+temporal_radius_rr: 0.15
+
+# 4. Training
+batch_size: 16         # Batch Size
+learning_rate: 0.00001
+epochs: 100
+patience: 100          # Early Stopping: N 에폭 동안 개선 없으면 중단
+weight_decay: 0.01
+device: "cuda"
+save_dir: "output/"
