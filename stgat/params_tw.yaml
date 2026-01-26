@@ -1,0 +1,117 @@
+# ===================================================================
+# ST-GAT DOGM (v6) - YAML CONFIG (matches gat_train_stgat_dogm_v6.py defaults)
+# ===================================================================
+
+# -------------------------------------------------------------------
+# 1) Data Selection
+# -------------------------------------------------------------------
+# v1 로봇정지 사람 왔다갔다
+# v2 A->C 멀어지는 사람 2명
+# v3 C->A 다가오는 사람 1명/멀어지는 사람 2명
+# v4 A->C 다가오는 사람 1명/멀어지는 사람 1명
+# v5 로봇 정지 횡방향 사람
+# v6 로봇 S자주행
+# v7 로봇 S자주행 멀어지는 사람 1명
+# v8 A->C 사람x
+# v9 로봇직진 사람 왔다갔다
+# v10 C->A 로봇직진 사람 왔다갔다 사람 1명 벽에  붙어서 다가옴
+# v11 A’->A 로봇직진 사람 왔다갔다
+# v12 A’-> A 로봇직진 사람 왔다갔다
+# v13 A’-> A 로봇직진 사람 왔다갔다
+# v14 A-> A’ 로봇직진 사람 왔다갔다
+
+data_root: "/mnt/samsung_ssd/hyunchang/data_v2/Basescan"   # 데이터 폴더 루트
+
+target_versions:
+  - "v1"
+  - "v2"
+  - "v3"
+  - "v4"
+  - "v5"
+  - "v6"
+  - "v7"
+  - "v8"
+  - "v9"
+  - "v10"
+  - "v11"
+  - "v12"
+  - "v13"
+  - "v14"
+
+train_versions: ["v11","v12","v13","v14"]
+
+val_versions: ["v9"]
+
+inference_version: "v9"
+
+inference_save_dir: "/mnt/samsung_ssd/hyunchang/inference_results"
+
+# NOTE:
+# - v6 파이썬은 기본적으로 YAML에서 data_root만 읽어 args.data_root에 반영합니다.
+# - 아래 2~5 섹션은 "v6 기본값을 YAML에 문서화"해둔 것이며,
+#   v6 코드 자체를 수정하지 않으면 학습/그래프 하이퍼파라미터는 ModelConfig/CLI 기준으로 동작합니다.
+
+# (선택) 모델 저장/로드 경로 (v6 코드에 하드코딩된 경로가 있을 수 있으니, 코드 쪽 확인 권장)
+model_path: "output/best_ckpt.pt"
+save_dir: "output/"
+
+# -------------------------------------------------------------------
+# 2) Model Hyperparameters  (v6: ModelConfig 기본값 문서화)
+# -------------------------------------------------------------------
+window_size: 4          # cfg.WINDOW
+hidden_dim: 64          # cfg.HIDDEN_DIM
+num_heads: 4            # cfg.NUM_HEADS
+dropout: 0.10           # cfg.DROPOUT
+
+# v6에는 num_layers(블록 반복 수)를 YAML로 조절하는 구조가 기본으로 없음
+# num_layers: 1
+
+# -------------------------------------------------------------------
+# 3) Graph Construction  (v6 기본값 문서화)
+# -------------------------------------------------------------------
+# (A) Spatial graph: v6는 radius gate 없이 kNN만 사용
+max_num_neighbors_lidar: 32   # cfg.K_LIDAR_SPATIAL
+max_num_neighbors_radar: 6    # cfg.K_RADAR_SPATIAL
+radius_ll: 0.0                # v6 미사용 (혼동 방지용)
+radius_rr: 0.0                # v6 미사용 (혼동 방지용)
+
+# (B) Temporal edges
+k_temporal: 12                # cfg.K_TEMPORAL
+temporal_adj_only: true       # cfg.TEMPORAL_ADJ_ONLY
+temporal_radius_ll: 0.15       # cfg.TEMPORAL_RADIUS_LIDAR
+temporal_radius_rr: 0.2       # cfg.TEMPORAL_RADIUS_RADAR
+
+# (C) Cross edges
+radius_cross: 0.5             # cfg.CROSS_RADIUS
+k_cross_l2r: 8                # cfg.K_CROSS_L2R
+k_cross_r2l: 4                # cfg.K_CROSS_R2L
+cross_dropout: 0.35           # cfg.CROSS_DROPOUT
+
+# -------------------------------------------------------------------
+# 4) Uncertainty (Sigma) Constraints  (v6 기본값 문서화)
+# -------------------------------------------------------------------
+min_sigma_lidar_m: 0.05       # cfg.MIN_SIGMA_LIDAR
+min_sigma_radar_v: 0.30       # cfg.MIN_SIGMA_RADAR
+sigma_bound_mode: "sigmoid"   # cfg.SIGMA_BOUND_MODE ("sigmoid" or "clamp")
+max_log_sigma: 2.0            # cfg.MAX_LOG_SIGMA
+
+# -------------------------------------------------------------------
+# 5) Training  (v6 기본값 문서화)
+# -------------------------------------------------------------------
+batch_size: 8                 # cfg.BATCH_SIZE
+learning_rate: 0.0003         # cfg.LR
+weight_decay: 0.0001          # cfg.WEIGHT_DECAY
+epochs: 100                    # cfg.EPOCHS
+patience: 100                 # v6 기본 EarlyStopping이 다르면 코드 쪽 확인 필요
+grad_clip: 1.0                # cfg.GRAD_CLIP
+
+device: "cuda"                # "cuda", "cpu", "cuda:0" 등
+amp: true                     # cfg.AMP
+seed: 42                      # set_seed(42)
+
+infer_full_points: true
+viz_sampling_rate: 1
+viz_near_vehicle_dist: 10.0
+
+use_wandb: true
+wandb_project: gat-dogm-training

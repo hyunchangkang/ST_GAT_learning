@@ -1,104 +1,120 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import GATConv, HeteroConv, Linear
+from torch_geometric.nn import HeteroConv, GATv2Conv, BatchNorm
+from torch_geometric.data import HeteroData
+from src.utils import build_graph
 
 class ST_HGAT(nn.Module):
-    def __init__(self, hidden_dim, num_layers, heads, metadata, node_in_dims):
-        """
-        ST-HGAT for Dynamic Uncertainty Estimation.
-        - metadata: (node_types, edge_types)
-        - node_in_dims: dict of input dimensions for each node type
-        """
+    def __init__(self, hidden_dim, num_layers, heads, metadata, node_in_dims, 
+                 radius_ll=0.25, radius_rr=1.5, radius_cross=0.6, 
+                 temporal_radius_ll=0.6, temporal_radius_rr=0.8,
+                 max_num_neighbors_lidar=16, max_num_neighbors_radar=32,
+                 # 물리적 제약 인자들
+                 min_sigma_lidar_m=0.05, max_sigma_lidar_m=2.0,
+                 min_sigma_radar_v=0.15, max_sigma_radar_v=5.0,
+                 scale_pose=10.0, scale_radar_v=5.0):
+        
         super(ST_HGAT, self).__init__()
         
-        self.node_types = metadata[0]
-        self.edge_types = metadata[1]
-        
-        # 1. Sensor-specific Encoders
-        self.encoder = nn.ModuleDict()
-        for node_type in self.node_types:
-            self.encoder[node_type] = nn.Sequential(
-                Linear(node_in_dims[node_type], hidden_dim),
-                nn.LeakyReLU(),
-                nn.LayerNorm(hidden_dim)
-            )
+        self.hidden_dim = hidden_dim
+        self.num_layers = num_layers
+        self.heads = heads
+        self.node_types, self.edge_types = metadata
 
-        # 2. Heterogeneous GNN Layers
+        self.radius_ll = radius_ll
+        self.radius_rr = radius_rr
+        self.radius_cross = radius_cross
+        self.temporal_radius_ll = temporal_radius_ll
+        self.temporal_radius_rr = temporal_radius_rr
+        self.max_Lnum = max_num_neighbors_lidar
+        self.max_Rnum = max_num_neighbors_radar
+
+        # Scaling Factors & Limits
+        self.min_l_norm = min_sigma_lidar_m / scale_pose
+        self.max_l_norm = max_sigma_lidar_m / scale_pose
+        self.range_l = self.max_l_norm - self.min_l_norm
+
+        self.min_r_norm = min_sigma_radar_v / scale_radar_v
+        self.max_r_norm = max_sigma_radar_v / scale_radar_v
+        self.range_r = self.max_r_norm - self.min_r_norm
+
+        # 1. Initial Feature Projections
+        self.proj_dict = nn.ModuleDict()
+        for nt in self.node_types:
+            self.proj_dict[nt] = nn.Linear(node_in_dims[nt], hidden_dim)
+
+        # 2. Heterogeneous GAT Layers
         self.convs = nn.ModuleList()
+        self.batch_norms = nn.ModuleList()
+        
         for _ in range(num_layers):
             conv_dict = {}
             for edge_type in self.edge_types:
-                src, _, dst = edge_type
-                # Self-loops help preserve node identity during message passing
-                self_loop = True if src == dst else False
-                conv_dict[edge_type] = GATConv(
-                    in_channels=hidden_dim,
-                    out_channels=hidden_dim // heads,
-                    heads=heads,
-                    add_self_loops=self_loop
+                # [핵심 수정] (-1, -1) -> hidden_dim 으로 변경!
+                # 이렇게 하면 모델 생성 시점에 바로 가중치 행렬이 [64, 64]로 만들어집니다.
+                conv_dict[edge_type] = GATv2Conv(
+                    hidden_dim,         
+                    hidden_dim // heads, 
+                    heads=heads, 
+                    add_self_loops=False,
+                    edge_dim=4  
                 )
-            self.convs.append(HeteroConv(conv_dict, aggr='sum'))
-
-        # 3. Prediction Heads (Mu and Sigma)
-        # LiDAR: predicts (x, y) and sigma_pos
-        self.l_head = nn.Sequential(
-            Linear(hidden_dim, 32),
-            nn.LeakyReLU(),
-            Linear(32, 3) 
-        )
-        # Radar: predicts v_radial and sigma_vel
-        self.r_head = nn.Sequential(
-            Linear(hidden_dim, 32),
-            nn.LeakyReLU(),
-            Linear(32, 2)
-        )
-
-    def forward(self, x_dict, edge_index_dict):
-        # Initial projection
-        out_dict = {}
-        for nt, x in x_dict.items():
-            if x.size(0) > 0:
-                out_dict[nt] = self.encoder[nt](x)
-
-        # Spatio-Temporal Message Passing
-        for conv in self.convs:
-            out_dict = conv(out_dict, edge_index_dict)
-            out_dict = {nt: F.leaky_relu(x) for nt, x in out_dict.items()}
-
-        device = next(self.parameters()).device
-
-        # # --- [Debug Section: Check instantly on first batch] ---
-        # if 'lidar' in x_dict and x_dict['lidar'].size(0) > 0:
-        #     unique_times = torch.unique(x_dict['lidar'][:, -1]).tolist()
-        #     # Force print for every batch to find the root cause immediately
-        #     print(f"\n[Model Debug] Step check - Unique dt: {unique_times}")
             
-        #     # Check if 0.0 exists with tolerance
-        #     has_target = any(abs(t - 0.0) < 1e-5 for t in unique_times)
-        #     if not has_target:
-        #         print(f"[Critical] t=0.0 is NOT found in this batch!")
-        # # -------------------------------------------------------
-        
-        # LiDAR Output: mu_l (x, y), sigma_l
-        if 'lidar' in out_dict and out_dict['lidar'].size(0) > 0:
-            res_l = self.l_head(out_dict['lidar'])
-            mu_l = res_l[:, :2]
-            sigma_l = F.softplus(res_l[:, 2:3]) + 1e-4
-        else:
-            mu_l = torch.empty((0, 2), device=device)
-            sigma_l = torch.empty((0, 1), device=device)
-        
-        # Radar Output Processing
-        def process_radar(key):
-            if key in out_dict and out_dict[key].size(0) > 0:
-                res_r = self.r_head(out_dict[key])
-                mu_r = res_r[:, 0:1]
-                sigma_r = F.softplus(res_r[:, 1:2]) + 1e-4
-                return mu_r, sigma_r
-            return torch.empty((0, 1), device=device), torch.empty((0, 1), device=device)
+            self.convs.append(HeteroConv(conv_dict, aggr='sum'))
+            
+            bn_dict = nn.ModuleDict()
+            for nt in self.node_types:
+                bn_dict[nt] = BatchNorm(hidden_dim)
+            self.batch_norms.append(bn_dict)
 
-        mu_r1, sigma_r1 = process_radar('radar1')
-        mu_r2, sigma_r2 = process_radar('radar2')
+        # 3. Reconstruction Heads
+        self.head_lidar = nn.Linear(hidden_dim, 3) 
+        self.head_radar = nn.Linear(hidden_dim, 2)
 
-        return mu_l, sigma_l, mu_r1, sigma_r1, mu_r2, sigma_r2
+    def forward(self, data: HeteroData):
+        # [Step 1] Graph Construction
+        edge_index_dict, edge_attr_dict = build_graph(
+            data, 
+            self.radius_ll, self.radius_rr, self.radius_cross,
+            self.temporal_radius_ll, self.temporal_radius_rr,
+            self.max_Lnum, self.max_Rnum,
+            data['lidar'].x.device
+        )
+
+        # [Step 2] Projection
+        x_dict = {}
+        for nt in self.node_types:
+            x_dict[nt] = F.elu(self.proj_dict[nt](data[nt].x))
+
+        # [Step 3] Message Passing
+        for i in range(self.num_layers):
+            x_dict = self.convs[i](
+                x_dict, 
+                edge_index_dict, 
+                edge_attr_dict=edge_attr_dict 
+            )
+            
+            for nt in self.node_types:
+                x_dict[nt] = F.elu(x_dict[nt])
+                x_dict[nt] = F.dropout(x_dict[nt], p=0.0, training=self.training)
+                x_dict[nt] = self.batch_norms[i][nt](x_dict[nt])
+
+        # [Step 4] Prediction with Scaled Sigmoid
+        
+        # --- LiDAR Head ---
+        out_l = self.head_lidar(x_dict['lidar'])
+        mu_l = out_l[:, :2] 
+        sig_l = self.range_l * torch.sigmoid(out_l[:, 2:]) + self.min_l_norm
+
+        # --- Radar1 Head ---
+        out_r1 = self.head_radar(x_dict['radar1'])
+        mu_r1 = out_r1[:, :1]
+        sig_r1 = self.range_r * torch.sigmoid(out_r1[:, 1:]) + self.min_r_norm
+
+        # --- Radar2 Head ---
+        out_r2 = self.head_radar(x_dict['radar2'])
+        mu_r2 = out_r2[:, :1]
+        sig_r2 = self.range_r * torch.sigmoid(out_r2[:, 1:]) + self.min_r_norm
+
+        return mu_l, sig_l, mu_r1, sig_r1, mu_r2, sig_r2

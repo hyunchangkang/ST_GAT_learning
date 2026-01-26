@@ -2,34 +2,87 @@ import torch
 import yaml
 import os
 import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from torch_geometric.data import Batch
-from scipy.spatial import cKDTree
 
+# Custom modules
 from src.dataset import get_selected_dataset
 from src.model import ST_HGAT
-from src.utils import build_graph
 
 def custom_collate(batch):
-    return Batch.from_data_list([item[0] for item in batch]), [item[1] for item in batch], [item[2] for item in batch], [item[3] for item in batch]
+    return Batch.from_data_list(batch)
+
+def apply_checkerboard_masking(batch):
+    batch_a = batch.clone()
+    batch_b = batch.clone()
+
+    mask_indices_a = {}
+    mask_indices_b = {}
+
+    # NOTE: dt bins are {0.0, 0.1, 0.2, 0.3} in dataset
+    # keep logic same (no big changes), but this assumes dt==0.0 is exact.
+    if 'lidar' in batch.node_types:
+        x = batch['lidar'].x
+        curr_mask = (x[:, -1] == 0)
+        curr_idx = torch.where(curr_mask)[0]
+        even_idx = curr_idx[::2]
+        odd_idx = curr_idx[1::2]
+
+        batch_a['lidar'].x[even_idx, 0] = 0.0
+        batch_a['lidar'].x[even_idx, 1] = 0.0
+        mask_indices_a['lidar'] = even_idx
+
+        batch_b['lidar'].x[odd_idx, 0] = 0.0
+        batch_b['lidar'].x[odd_idx, 1] = 0.0
+        mask_indices_b['lidar'] = odd_idx
+
+    for key in ['radar1', 'radar2']:
+        if key in batch.node_types:
+            x = batch[key].x
+            curr_mask = (x[:, -1] == 0)
+            curr_idx = torch.where(curr_mask)[0]
+            even_idx = curr_idx[::2]
+            odd_idx = curr_idx[1::2]
+
+            batch_a[key].x[even_idx, 2] = 0.0
+            mask_indices_a[key] = even_idx
+
+            batch_b[key].x[odd_idx, 2] = 0.0
+            mask_indices_b[key] = odd_idx
+
+    final_batch = Batch.from_data_list([batch_a, batch_b])
+    return final_batch, mask_indices_a, mask_indices_b
 
 def inference():
-    # 1. Config & Device Setup
+    # 1. Config
     config_path = "config/params.yaml"
-    with open(config_path, "r") as f: cfg = yaml.safe_load(f)
-    device = torch.device(cfg['device'] if torch.cuda.is_available() else 'cpu')
+    with open(config_path, "r") as f:
+        cfg = yaml.safe_load(f)
+
+    device = torch.device(cfg.get('device', 'cuda' if torch.cuda.is_available() else 'cpu'))
     print(f"[Inference] Device: {device}")
 
-    # 2. Dataset Setup
+    # 2. Dataset
     target_vers = cfg.get('inference_version', "v2")
+    print(f"[Inference] Target Version: {target_vers}")
+
     dataset = get_selected_dataset(cfg['data_root'], [target_vers], cfg['window_size'])
     inner_dataset = dataset.datasets[0]
     loader = DataLoader(dataset, batch_size=1, shuffle=False, collate_fn=custom_collate)
 
-    # 3. Model Initialization (Fixing TypeError)
+    # >>> [FIX-1] Use dataset scaling to stay consistent
+    SCALE_POSE = float(getattr(inner_dataset, "scale_pose", 10.0))
+    SCALE_RADAR_V = float(getattr(inner_dataset, "scale_radar_v", 5.0))
+    print(f"[Inference] SCALE_POSE={SCALE_POSE}, SCALE_RADAR_V={SCALE_RADAR_V}")
+
+    # Sigma limits (physical units) for normalization column
+    MIN_SIG_L = float(cfg.get('min_sigma_lidar_m', 0.03))
+    MAX_SIG_L = float(cfg.get('max_sigma_lidar_m', 0.2))
+    MIN_SIG_R = float(cfg.get('min_sigma_radar_v', 0.05))
+    MAX_SIG_R = float(cfg.get('max_sigma_radar_v', 1.5))
+
+    # 3. Model init (match train scaling)
     node_types = ['lidar', 'radar1', 'radar2']
     edge_types = [
         ('lidar', 'spatial', 'lidar'), ('lidar', 'temporal', 'lidar'),
@@ -39,148 +92,146 @@ def inference():
         ('radar2', 'to', 'lidar'), ('lidar', 'to', 'radar2')
     ]
     metadata = (node_types, edge_types)
-    
-    # Use dummy batch for dimension check
-    dummy_batch = dataset[0][0]
-    node_in_dims = {nt: dummy_batch[nt].x.size(1) for nt in node_types}
 
+    raw_sample = dataset[0]
+    node_in_dims = {nt: raw_sample[nt].x.size(1) for nt in node_types}
+
+    # >>> [FIX-2] Pass temporal radii + neighbors exactly like train (scale_pose applied)
     model = ST_HGAT(
-        hidden_dim=cfg['hidden_dim'], 
-        num_layers=cfg['num_layers'], 
-        heads=cfg['num_heads'], 
+        hidden_dim=cfg['hidden_dim'],
+        num_layers=cfg['num_layers'],
+        heads=cfg['num_heads'],
         metadata=metadata,
-        node_in_dims=node_in_dims
+        node_in_dims=node_in_dims,
+
+        radius_ll=float(cfg['radius_ll']) / SCALE_POSE,
+        radius_rr=float(cfg['radius_rr']) / SCALE_POSE,
+        radius_cross=float(cfg['radius_cross']) / SCALE_POSE,
+
+        temporal_radius_ll=float(cfg.get('temporal_radius_ll', 0.6)) / SCALE_POSE,
+        temporal_radius_rr=float(cfg.get('temporal_radius_rr', 0.6)) / SCALE_POSE,
+
+        max_num_neighbors_lidar=int(cfg.get('max_num_neighbors_lidar', 20)),
+        max_num_neighbors_radar=int(cfg.get('max_num_neighbors_radar', 20)),
+
+        min_sigma_lidar_m=MIN_SIG_L,
+        max_sigma_lidar_m=MAX_SIG_L,
+        min_sigma_radar_v=MIN_SIG_R,
+        max_sigma_radar_v=MAX_SIG_R,
+
+        scale_pose=SCALE_POSE,
+        scale_radar_v=SCALE_RADAR_V
     ).to(device)
-    
+
+    # Load
     model_path = os.path.join(cfg['save_dir'], "best_model.pth")
     if not os.path.exists(model_path):
         print(f"[Error] Model not found at {model_path}")
         return
-        
     model.load_state_dict(torch.load(model_path, map_location=device))
     model.eval()
+    print("[*] Model loaded successfully.")
 
-    # 4. Data Loading (Raw BaseScan & Odom for Global Transformation)
-    print(f"[Inference] Loading Raw Data for Version: {target_vers}")
-    raw_dfs = {
-        'lidar': pd.read_csv(os.path.join(cfg['data_root'], "Basescan", f"LiDARMap_BaseScan_{target_vers}.txt"), sep='\s+', header=None),
-        'radar1': pd.read_csv(os.path.join(cfg['data_root'], "Basescan", f"Radar1Map_BaseScan_{target_vers}.txt"), sep='\s+', header=None),
-        'radar2': pd.read_csv(os.path.join(cfg['data_root'], "Basescan", f"Radar2Map_BaseScan_{target_vers}.txt"), sep='\s+', header=None)
-    }
-    odom_df = pd.read_csv(os.path.join(cfg['data_root'], f"odom_filtered_{target_vers}.txt"), sep='\s+', header=None, names=['t', 'x', 'y', 'yaw', 'v', 'w'])
-
-    save_buffers = {'lidar': [], 'radar1': [], 'radar2': []}
-    vis_results = {'lidar': [], 'radar1': [], 'radar2': []}
+    # 4. Inference loop
+    print("[Inference] Running Checkerboard Inference...")
+    result_buffers = {'lidar': [], 'radar1': [], 'radar2': []}
     timestamps = inner_dataset.ts
-    scale_pos = 10.0 # Scaling factor used during training
 
-    print(f"[Inference] Processing Frames & Global Mapping...")
+    def norm01(sig_phys, mn, mx):
+        denom = (mx - mn) if (mx - mn) > 1e-9 else 1.0
+        return torch.clamp((sig_phys - mn) / denom, 0.0, 1.0)
+
     with torch.no_grad():
-        # Iterate over loader to handle windowed sequences
-        for idx in tqdm(range(len(loader) - 1)):
-            # Load specific batch data
-            batch_data, _, _, _ = dataset[idx]
+        for idx, batch_data in enumerate(tqdm(loader)):
             batch_data = batch_data.to(device)
-            
-            base_t = timestamps[inner_dataset.indices[idx]] # Robot Pose at t=0
-            target_ts_plus_1 = timestamps[inner_dataset.indices[idx] + 1] # Target Frame at t+1
-        
-            # Build Graph and Run Model
-            edge_index_dict = build_graph(
-                batch_data, cfg['radius_ll'], cfg['radius_rr'], cfg['radius_cross'], 
-                cfg.get('temporal_radius_ll', 0.15), cfg.get('temporal_radius_rr', 0.3), device
-            )
-            _, sig_l, _, sig_r1, _, sig_r2 = model(batch_data.x_dict, edge_index_dict)
 
-            # Global and Inverse Local Transformation Matrices
-            T_target = inner_dataset.get_T(target_ts_plus_1) # Pose at t+1
-            T_inv_base = np.linalg.inv(inner_dataset.get_T(base_t)) # Inverse Pose at t
+            parallel_batch, mask_a, mask_b = apply_checkerboard_masking(batch_data)
+            mu_l, sig_l, mu_r1, sig_r1, mu_r2, sig_r2 = model(parallel_batch)
 
-            def process(sig, key):
-                if sig.size(0) == 0: return
-                
-                # Filter model outputs for the current time step (dt=0)
-                mask = (batch_data[key].x[:, -1] == 0).cpu().numpy()
-                if not np.any(mask): return # Prevent IndexError for empty nodes (Frame 174)
-                
-                sig_f = sig.cpu().numpy()[mask]
-                tree = cKDTree(batch_data[key].pos[mask].cpu().numpy()) 
+            num_l = batch_data['lidar'].x.size(0)
+            num_r1 = batch_data['radar1'].x.size(0)
+            num_r2 = batch_data['radar2'].x.size(0)
 
-                # Load raw global points for target t+1
-                raw_frame = raw_dfs[key][np.round(raw_dfs[key][0], 1) == np.round(target_ts_plus_1, 1)].copy()
-                if raw_frame.empty: return
-                
-                xy_local_raw = raw_frame[[1, 2]].values # Points in local sensor frame at t+1
-                xy_h = np.hstack([xy_local_raw, np.ones((len(xy_local_raw), 1))])
-                
-                # 1. Global Transformation (Mapping)
-                xy_global = (T_target @ xy_h.T).T[:, :2]
-                
-                # 2. Inverse Matching Transformation (Aligning t+1 points to t=0 robot frame)
-                xy_local_match = (T_inv_base @ (T_target @ xy_h.T)).T[:, :2]
-                
-                # 3. Spatial Matching & Uncertainty Recovery
-                _, indices = tree.query(xy_local_match / scale_pos, k=1)
-                mapped_sig = sig_f[indices] * scale_pos # Scale back to meters (m)
-                
-                # 4. Store Results
-                raw_frame['sigma'] = mapped_sig
-                save_buffers[key].append(raw_frame)
-                vis_results[key].append({'pos': xy_global, 'sigma': mapped_sig})
+            # Current-frame masks
+            curr_mask_l = (batch_data['lidar'].x[:, -1] == 0)
+            curr_mask_r1 = (batch_data['radar1'].x[:, -1] == 0)
+            curr_mask_r2 = (batch_data['radar2'].x[:, -1] == 0)
 
-            process(sig_l, 'lidar'); process(sig_r1, 'radar1'); process(sig_r2, 'radar2')
+            # Merge sigma from checkerboard
+            def merge_sigma(sig_all, num_nodes, maskA, maskB, curr_mask):
+                global_curr_idx = torch.where(curr_mask)[0]
+                if global_curr_idx.numel() == 0:
+                    return torch.empty(0, 1, device=device)
 
-    # 5. Save Results to SSD Path
+                res_dict = {}
+                if len(maskA) > 0:
+                    for gidx in maskA:
+                        res_dict[int(gidx.item())] = sig_all[:num_nodes][gidx]
+                if len(maskB) > 0:
+                    for gidx in maskB:
+                        res_dict[int(gidx.item())] = sig_all[num_nodes:][gidx]
+
+                if len(res_dict) == 0:
+                    return torch.empty(0, 1, device=device)
+
+                return torch.stack([res_dict[int(i.item())] for i in global_curr_idx])
+
+            sorted_sig_l = merge_sigma(sig_l, num_l, mask_a.get('lidar', []), mask_b.get('lidar', []), curr_mask_l)
+            sorted_sig_r1 = merge_sigma(sig_r1, num_r1, mask_a.get('radar1', []), mask_b.get('radar1', []), curr_mask_r1)
+            sorted_sig_r2 = merge_sigma(sig_r2, num_r2, mask_a.get('radar2', []), mask_b.get('radar2', []), curr_mask_r2)
+
+            # Save result
+            if idx >= len(inner_dataset.indices):
+                break
+            base_t = timestamps[inner_dataset.indices[idx]]
+            T_base = inner_dataset.get_T(base_t)
+            T_base_torch = torch.tensor(T_base, dtype=torch.float, device=device)
+
+            def save_result(sig_normed, key, curr_mask):
+                if sig_normed.size(0) == 0:
+                    return
+
+                local_pos = batch_data[key].pos[curr_mask]
+                ones = torch.ones(local_pos.size(0), 1, device=device)
+
+                # pos is normalized (meters/scale_pose) -> convert back to meters before transform
+                local_pos_h = torch.cat([local_pos * SCALE_POSE, ones], dim=1)
+                global_pos = (T_base_torch @ local_pos_h.T).T[:, :2]
+
+                # sigma is normalized units -> convert to physical units
+                if key == 'lidar':
+                    sig_phys = sig_normed * SCALE_POSE  # meters
+                    sig01 = norm01(sig_phys, MIN_SIG_L, MAX_SIG_L)
+                    res = torch.cat([global_pos, sig_phys, sig01], dim=1)
+                else:
+                    sig_phys = sig_normed * SCALE_RADAR_V  # m/s
+                    sig01 = norm01(sig_phys, MIN_SIG_R, MAX_SIG_R)
+                    res = torch.cat([global_pos, sig_phys, sig01], dim=1)
+
+                result_buffers[key].append(res.detach().cpu().numpy())
+
+            save_result(sorted_sig_l, 'lidar', curr_mask_l)
+            save_result(sorted_sig_r1, 'radar1', curr_mask_r1)
+            save_result(sorted_sig_r2, 'radar2', curr_mask_r2)
+
+    # 5. Save files
     save_dir = "/mnt/samsung_ssd/hyunchang/inference_results"
-    if not os.makedirs(save_dir, exist_ok=True): pass
-    
-    for key, buffer in save_buffers.items():
+    os.makedirs(save_dir, exist_ok=True)
+    print(f"[Inference] Saving results to {save_dir}...")
+
+    for key, buffer in result_buffers.items():
         if buffer:
-            final_df = pd.concat(buffer)
-            save_path = os.path.join(save_dir, f"Predict_Sigma_{key}_{target_vers}.txt")
-            final_df.to_csv(save_path, sep=' ', index=False, header=False)
-            print(f"[*] Results saved: {save_path}")
+            final_array = np.vstack(buffer)
+            save_path = os.path.join(save_dir, f"Result_{key}_{target_vers}.txt")
 
-    # 6. Global Confidence Map Visualization (Red=Certain, Blue=Uncertain)
-    print(f"[Inference] Generating Global Map...")
-    fig, ax = plt.subplots(figsize=(20, 15))
-    cmap = plt.get_cmap('jet_r') # 0.0 (Red, High Confidence) to 1.0 (Blue, Low Confidence)
-    
-    LIMIT_LIDAR = 0.5 # Uncertainty Threshold for LiDAR (m)
-    LIMIT_RADAR = 2.0 # Uncertainty Threshold for Radar (m)
+            # >>> [FIX-3] Add sigma_norm(0~1) column for consistent color mapping in plot
+            if key == 'lidar':
+                header = 'x y sigma sigma_norm'   # sigma: meters
+            else:
+                header = 'x y sig_vr sigma_norm'  # sig_vr: m/s
 
-    # Plot Robot Trajectory
-    ax.plot(odom_df['x'], odom_df['y'], c='black', linewidth=1.5, alpha=0.5, label='Robot Trajectory', zorder=1)
-    
-    def plot_sensor(key, marker, label, zorder, limit_val):
-        if not vis_results[key]: return
-        pos = np.vstack([d['pos'] for d in vis_results[key]])
-        sig = np.concatenate([d['sigma'] for d in vis_results[key]])
-        
-        # Color mapping: sig -> 0.0 (Red) is Certain, 1.0 (Blue) is Uncertain
-        norm_sig = np.clip(sig / limit_val, 0, 1)
-        colors = cmap(norm_sig) 
-        ax.scatter(pos[:, 0], pos[:, 1], c=colors, s=1.2, marker=marker, alpha=0.8, label=label, zorder=zorder)
-
-    # Order layers for visualization (Radar first, then LiDAR)
-    plot_sensor('radar1', '^', 'Radar 1', 2, LIMIT_RADAR)
-    plot_sensor('radar2', 'v', 'Radar 2', 2, LIMIT_RADAR)
-    plot_sensor('lidar', '.', 'LiDAR', 3, LIMIT_LIDAR) 
-    
-    ax.set_title(f'Global Confidence Map (Sequence: {target_vers}) | Red: High Confidence', fontsize=18)
-    ax.set_xlabel('Global X (m)', fontsize=14); ax.set_ylabel('Global Y (m)', fontsize=14)
-    ax.axis('equal'); ax.grid(True, alpha=0.3)
-    ax.legend(loc='upper right', markerscale=5)
-    
-    # Add Colorbar for uncertainty reference
-    sm = plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(vmin=0, vmax=1))
-    cbar = fig.colorbar(sm, ax=ax, shrink=0.5)
-    cbar.set_label('Confidence Score (Red: Confident, Blue: Unconfident)')
-    
-    plot_save_path = os.path.join(save_dir, f"confidence_map_{target_vers}.png")
-    plt.savefig(plot_save_path, dpi=300, bbox_inches='tight')
-    plt.close()
-    print(f"[*] Global map visualization saved: {plot_save_path}")
+            np.savetxt(save_path, final_array, fmt='%.4f', delimiter=' ', header=header, comments='')
+            print(f"[*] Saved: {save_path} (Shape: {final_array.shape})")
 
 if __name__ == "__main__":
     inference()

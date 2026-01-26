@@ -38,24 +38,24 @@ target_versions:
 train_versions:  
   - "v1"
   - "v2"
-  # - "v3"
-  # - "v4"
+  - "v3"
+  - "v4"
   - "v5"
   - "v6"
   - "v7"
   - "v8"
   - "v9"
   - "v10"
-  - "v11"
-  - "v12"
-  # - "v13"
+  # - "v11"
+  # - "v12"
+  - "v13"
   - "v14"
 
 val_versions:    
-  - "v3"
-  - "v13"
+  # - "v3"
+  - "v11"
 
-inference_version: "v4"
+inference_version: "v12"
 
 model_path: "output/best_model.pth"  # 로드할 모델 경로 (best_model 사용 권장)
 
@@ -71,14 +71,23 @@ radius_rr: 1.0        # Radar-Radar
 radius_cross: 0.5     # Fusion
 
 # Temporal Radius
-temporal_radius_ll: 0.15  
-temporal_radius_rr: 0.15
+temporal_radius_ll: 0.3  
+temporal_radius_rr: 0.3
+
+min_sigma_lidar_m: 0.03   # 최소 5cm
+max_sigma_lidar_m: 0.2    # 최대 2m (새로 추가됨)
+
+min_sigma_radar_v: 0.05   # 최소 0.15 m/s
+max_sigma_radar_v: 1.5    # 최대 5m/s (새로 추가됨)
+
+max_num_neighbors_lidar: 32  
+max_num_neighbors_radar: 16 
 
 # 4. Training
 batch_size: 16         # Batch Size
-learning_rate: 0.00001
-epochs: 100
-patience: 100          # Early Stopping: N 에폭 동안 개선 없으면 중단
-weight_decay: 0.01
+learning_rate: 0.0001
+epochs: 500
+patience: 500         # Early Stopping: N 에폭 동안 개선 없으면 중단
+weight_decay: 0.0001
 device: "cuda"
 save_dir: "output/"

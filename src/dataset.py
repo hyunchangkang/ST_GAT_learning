@@ -30,9 +30,10 @@ class SingleSequenceDataset(Dataset):
         # Timestamp binning (0.1s interval) to handle jitter
         self.ts = sorted(self.lidar_df['t'].round(1).unique())
         
-        # Valid indices: We need window_size frames for input and 1 frame for target (t+1)
-        # So window ends at len(ts) - 2 to allow ts[i+1] to exist
-        self.indices = range(window_size - 1, len(self.ts) - 1)
+        # [수정] Valid indices
+        # 기존: range(window_size - 1, len(self.ts) - 1) -> t+1을 위해 마지막 하나를 남겨둠
+        # 변경: range(window_size - 1, len(self.ts))     -> t 시점 복원이므로 마지막 프레임까지 다 씀
+        self.indices = range(window_size - 1, len(self.ts))
 
         # Empirical scaling
         self.scale_pose = 10.0
@@ -52,10 +53,11 @@ class SingleSequenceDataset(Dataset):
         return len(self.indices)
 
     def __getitem__(self, idx):
-        # Target time is t+1, current window ends at t
+        # Current window ends at t
         current_idx = self.indices[idx]
-        target_t = self.ts[current_idx + 1] # Next frame for GT
-        base_t = self.ts[current_idx]      # Current frame for coordinate base
+        base_t = self.ts[current_idx]      # Current frame for coordinate base (t)
+        
+        # [수정] target_t (t+1) 삭제됨
         
         window_ts = self.ts[current_idx - self.window_size + 1 : current_idx + 1]
         T_inv_base = np.linalg.inv(self.get_T(base_t))
@@ -94,32 +96,11 @@ class SingleSequenceDataset(Dataset):
             else:
                 data[key].x, data[key].pos = torch.empty((0, dim)), torch.empty((0, 2))
 
-        # Ground Truth construction (t+1)
-        # GT should be in the coordinate system of t (base_t) to predict next movement
-        T_inv_base = np.linalg.inv(self.get_T(base_t))
-        T_target = self.get_T(target_t)
-        T_rel_target = T_inv_base @ T_target
-
-        def get_gt_transformed(df, key):
-            raw = df[df['t'].round(1) == round(target_t, 1)].values
-            if len(raw) == 0: return torch.empty((0, 2 if key=='lidar' else 3))
-            
-            # Transform target xy to base_t coordinate
-            xy_h = np.hstack([raw[:, 1:3], np.ones((len(raw), 1))])
-            gt_xy = (T_rel_target @ xy_h.T).T[:, :2] /  self.scale_pose
-            
-            if key == 'lidar':
-                return torch.tensor(gt_xy, dtype=torch.float)
-            else:
-                # Radar GT includes transformed xy and scaled vr
-                gt_vr = np.clip(raw[:, 3:4] / self.scale_radar_v, -1, 1)
-                return torch.tensor(np.hstack([gt_xy, gt_vr]), dtype=torch.float)
-
-        gl_gt = get_gt_transformed(self.lidar_df, 'lidar')
-        gr1_gt = get_gt_transformed(self.radar1_df, 'radar1')
-        gr2_gt = get_gt_transformed(self.radar2_df, 'radar2')
+        # [수정] Ground Truth construction (t+1) 로직 전체 삭제
+        # 이제 모델은 t 시점의 데이터를 마스킹하고 복원하는 것이 목표이므로, 
+        # t+1 데이터는 필요하지 않음.
         
-        return data, gl_gt, gr1_gt, gr2_gt
+        return data
 
 def get_selected_dataset(root, vers, win):
     return SensorFusionDataset(root, vers, win)

@@ -1,109 +1,89 @@
 import torch
 import torch.nn as nn
-import math
+import torch.nn.functional as F
 
 class SelfSupervisedLoss(nn.Module):
-
-    def __init__(self, device, min_sigma_lidar_m=0.02, min_sigma_radar_v=0.1, dist_threshold=1.0):
-        """
-        [Physical Constraints Setup]
-        Accepts physical units (meters, m/s) and converts them to normalized units 
-        used by the network training process.
-        
-        Args:
-            device: torch device
-            min_sigma_lidar_m (float): Minimum physical position uncertainty for LiDAR (Default: 0.1m = 10cm)
-            min_sigma_radar_v (float): Minimum physical velocity uncertainty for Radar (Default: 0.15m/s)
-            dist_threshold (float): Distance threshold for matching (m)
-        """
+    def __init__(self, device, min_sigma_lidar_m=0.03, min_sigma_radar_v=0.1):
         super().__init__()
         self.device = device
-        self.dist_threshold = dist_threshold
         
-        # --- [Hardcoded Scale Factors from dataset.py] ---
-        # Ensure these match the scaling factors in SingleSequenceDataset!
-        SCALE_POSE = 10.0      # LiDAR Position Scaling
-        SCALE_RADAR_V = 5.0    # Radar Velocity Scaling
+        # Scaling Factors (dataset.py와 일치)
+        self.SCALE_POSE = 10.0      
+        self.SCALE_RADAR_V = 5.0    
 
-        # --- [Conversion: Physical -> Normalized] ---
-        # The network predicts normalized values, so we clamp using normalized thresholds.
-        self.min_sig_l = min_sigma_lidar_m / SCALE_POSE  # e.g., 0.1m / 10.0 = 0.01
-        self.min_sig_r = min_sigma_radar_v / SCALE_RADAR_V # e.g., 0.15m/s / 5.0 = 0.03
-
-    def forward(self, mu_l, log_l, gt_l, mu_r1, log_r1, gt_r1, pos_r1, mu_r2, log_r2, gt_r2, pos_r2):
-        # 1. Individual sensor loss calculations (Same as original)
-        l_l, n_l = self._lidar_loss(mu_l, log_l, gt_l)
-        l_r1, n_r1 = self._radar_loss(mu_r1, log_r1, gt_r1, pos_r1)
-        l_r2, n_r2 = self._radar_loss(mu_r2, log_r2, gt_r2, pos_r2)
-
-        # 2. Original Weights: 0.5, 0.25, 0.25
-        w_l, w_r1, w_r2 = 0.5, 0.25, 0.25
+        # Min Sigma Thresholds (Normalized)
+        self.min_sig_l = min_sigma_lidar_m / self.SCALE_POSE
+        self.min_sig_r = min_sigma_radar_v / self.SCALE_RADAR_V
         
-        total_loss = 0.0
-        has_loss = False
+        # [수정 사항 1] MSE Weight 추가 (Auxiliary Task)
+        # NLL이 Gradient Vanishing에 빠져도 위치(mu) 학습을 지속시키는 가이드 역할
+        self.mse_weight = 1.0  
         
-        if n_l > 0:
-            total_loss += w_l * l_l
-            has_loss = True
-        if n_r1 > 0:
-            total_loss += w_r1 * l_r1
-            has_loss = True
-        if n_r2 > 0:
-            total_loss += w_r2 * l_r2
-            has_loss = True
+        # [수정 사항 2] Penalty 삭제
+        # model.py에서 이미 Max Sigma 제한을 걸었으므로, 불필요한 규제 제거
+        self.penalty_weight = 0.0
 
-        if not has_loss:
-            return torch.tensor(0.0, device=self.device, requires_grad=True), l_l, l_r1, l_r2
-            
+    def forward(self, mu_l, sig_l, gt_l, mask_idx_l,
+                mu_r1, sig_r1, gt_r1, mask_idx_r1,
+                mu_r2, sig_r2, gt_r2, mask_idx_r2):
+        
+        # 각 센서별로 NLL과 MSE를 계산하여 반환받음
+        l_l, mse_l = self._lidar_loss(mu_l, sig_l, gt_l, mask_idx_l)
+        l_r1, mse_r1 = self._radar_loss(mu_r1, sig_r1, gt_r1, mask_idx_r1)
+        l_r2, mse_r2 = self._radar_loss(mu_r2, sig_r2, gt_r2, mask_idx_r2)
+
+        # [수정 사항 3] 최종 Loss 합산 로직 변경
+        # Total Loss = NLL(Aleatoric) + 1.0 * MSE(Mean Estimation)
+        loss_lidar = l_l + (self.mse_weight * mse_l)
+        loss_radar1 = l_r1 + (self.mse_weight * mse_r1)
+        loss_radar2 = l_r2 + (self.mse_weight * mse_r2)
+
+        total_loss = loss_lidar + loss_radar1 + loss_radar2
+        
+        # 로깅을 위해 분해된 값 반환
         return total_loss, l_l, l_r1, l_r2
 
-    def _lidar_loss(self, mu, log_v, gt):
-        """
-        Original LiDAR spatial distance loss with new sigma clamping.
-        """
-        if mu.size(0) == 0 or gt.size(0) == 0: 
-            return torch.tensor(0.0, device=self.device, requires_grad=True), 0
-        
-        # [Modified] Clamp sigma based on physical value
-        sigma = torch.exp(0.5 * log_v)
-        sigma = torch.clamp(sigma, min=self.min_sig_l)
-        valid_log_v = 2 * torch.log(sigma)
-        
-        d = torch.cdist(mu, gt)
-        min_d, _ = torch.min(d, dim=1)
-        
-        # Original distance filtering
-        mask = min_d < self.dist_threshold
-        if not mask.any(): 
-            return torch.tensor(0.0, device=self.device, requires_grad=True), 0
-        
-        v_log_v = valid_log_v[mask]
-        # Predictive NLL formula
-        loss = (0.5 * torch.exp(-v_log_v) * (min_d[mask]**2) + 0.5 * v_log_v).mean()
-        return loss, mask.sum().item()
+    def _lidar_loss(self, mu, sigma, gt, mask_idx):
+        # 마스킹 된 데이터가 없으면 0 반환
+        if mask_idx is None or len(mask_idx) == 0:
+            return torch.tensor(0.0, device=self.device), torch.tensor(0.0, device=self.device)
 
-    def _radar_loss(self, mu, log_v, gt, pos):
-        """
-        Original Radar velocity error loss with new sigma clamping.
-        """
-        if mu.size(0) == 0 or gt.size(0) == 0: 
-            return torch.tensor(0.0, device=self.device, requires_grad=True), 0
+        pred = mu[mask_idx]
+        sig = sigma[mask_idx]
+        target = gt
+
+        # 수치 안정성을 위한 최소값 제한
+        sig = torch.clamp(sig, min=self.min_sig_l)
+
+        # 1. NLL Loss (메인: 불확실성 추론)
+        err_sq = (pred - target)**2
+        var = sig**2
+        log_var = torch.log(var)
+        nll_loss = (0.5 * err_sq / var) + (0.5 * log_var)
         
-        # [Modified] Clamp sigma based on physical value
-        sigma = torch.exp(0.5 * log_v)
-        sigma = torch.clamp(sigma, min=self.min_sig_r)
-        valid_log_v = 2 * torch.log(sigma)
+        # 2. MSE Loss (보조: 위치 추정 가이드)
+        # Sigma의 간섭 없이 순수하게 위치 오차만 계산
+        mse_loss = F.mse_loss(pred, target)
         
-        # Original anchor-based matching
-        d = torch.cdist(pos, gt[:, :2])
-        min_d, idx = torch.min(d, dim=1)
+        return nll_loss.mean(), mse_loss
+
+    def _radar_loss(self, mu, sigma, gt, mask_idx):
+        if mask_idx is None or len(mask_idx) == 0:
+            return torch.tensor(0.0, device=self.device), torch.tensor(0.0, device=self.device)
+
+        pred = mu[mask_idx]
+        sig = sigma[mask_idx]
+        target = gt
+
+        sig = torch.clamp(sig, min=self.min_sig_r)
+
+        # 1. NLL Loss
+        err_sq = (pred - target)**2
+        var = sig**2
+        log_var = torch.log(var)
+        nll_loss = (0.5 * err_sq / var) + (0.5 * log_var)
         
-        mask = min_d < self.dist_threshold
-        if not mask.any(): 
-            return torch.tensor(0.0, device=self.device, requires_grad=True), 0
+        # 2. MSE Loss
+        mse_loss = F.mse_loss(pred, target)
         
-        matched_gt_v = gt[idx[mask], 2].unsqueeze(1)
-        err = (mu[mask] - matched_gt_v)**2
-        v_log_v = valid_log_v[mask]
-        loss = (0.5 * torch.exp(-v_log_v) * err + 0.5 * v_log_v).mean()
-        return loss, mask.sum().item()
+        return nll_loss.mean(), mse_loss
