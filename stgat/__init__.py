@@ -7,7 +7,7 @@ from .model import DOGMSTGATUncertaintyNet
 from .loss import UncertaintyLoss
 from .preprocess import mask_inputs_for_mu, normalize_node_features, normalize_edges_inplace
 from .train_eval import train_one_epoch, eval_one_epoch
-from .infer import infer_export
+from .infer_export import infer_export
 from .utils import set_seed
 
 __all__ = [

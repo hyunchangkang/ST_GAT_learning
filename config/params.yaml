@@ -36,28 +36,28 @@ target_versions:
   - "v14"
 
 train_versions:  
-  - "v1"
-  - "v2"
-  - "v3"
-  - "v4"
-  - "v5"
-  - "v6"
-  - "v7"
+  # - "v1"
+  # - "v2"
+  # - "v3"
+  # - "v4"
+  # - "v5"
+  # - "v6"
+  # - "v7"
   - "v8"
-  - "v9"
-  - "v10"
+  # - "v9"
+  # - "v10"
   # - "v11"
   # - "v12"
-  - "v13"
-  - "v14"
+  # - "v13"
+  # - "v14"
 
 val_versions:    
   # - "v3"
-  - "v11"
+  - "v8"
 
-inference_version: "v12"
+inference_version: "v8"
 
-model_path: "output/best_model.pth"  # 로드할 모델 경로 (best_model 사용 권장)
+model_path: "output/best_model.pth"  
 
 # 2. Model Hyperparameters
 window_size: 4        # 과거 4프레임 참조 (t-4 ~ t-1)
@@ -68,17 +68,18 @@ num_layers: 3         # GNN 레이어 개수
 # 3. Graph Construction (Radius)
 radius_ll: 0.15        # LiDAR-LiDAR
 radius_rr: 1.0        # Radar-Radar
-radius_cross: 0.5     # Fusion
+radius_cross: 1.0     # Fusion
 
 # Temporal Radius
-temporal_radius_ll: 0.3  
-temporal_radius_rr: 0.3
+temporal_radius_ll: 0.15  
+temporal_radius_rr: 0.15
 
-min_sigma_lidar_m: 0.03   # 최소 5cm
-max_sigma_lidar_m: 0.2    # 최대 2m (새로 추가됨)
+min_sigma_lidar_m: 0.03   
+max_sigma_lidar_m: 0.2   
 
-min_sigma_radar_v: 0.05   # 최소 0.15 m/s
-max_sigma_radar_v: 1.5    # 최대 5m/s (새로 추가됨)
+min_sigma_radar_v: 0.05   
+max_sigma_radar_v: 1.5    
+
 
 max_num_neighbors_lidar: 32  
 max_num_neighbors_radar: 16 

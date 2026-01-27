@@ -10,7 +10,7 @@ import wandb
 from .config import ModelConfig, load_yaml_config, parse_versions, apply_yaml_to_cfg
 from .data import MultiRunTextWindowDataset, collate_fn
 from .graph import GraphBuilder
-from .infer import infer_export
+from .infer_export import infer_export
 from .loss import UncertaintyLoss
 from .model import DOGMSTGATUncertaintyNet
 from .train_eval import train_one_epoch, eval_one_epoch
@@ -269,7 +269,7 @@ def infer_from_yaml(config_path: Optional[str] = None) -> None:
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
 
     # Export options
-    full_points = bool(yaml_cfg.get("infer_full_points", False))
+    full_points = bool(yaml_cfg.get("infer_full_points", True))
     max_frames = yaml_cfg.get("infer_max_frames", None)
     max_frames = int(max_frames) if max_frames is not None else None
 

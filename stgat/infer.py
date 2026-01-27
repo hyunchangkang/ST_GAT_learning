@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import argparse
-from stgat.runner import infer_from_yaml
+from .runner import infer_from_yaml
 
 def main() -> None:
     parser = argparse.ArgumentParser()

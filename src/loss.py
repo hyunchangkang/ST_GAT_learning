@@ -15,10 +15,6 @@ class SelfSupervisedLoss(nn.Module):
         self.min_sig_l = min_sigma_lidar_m / self.SCALE_POSE
         self.min_sig_r = min_sigma_radar_v / self.SCALE_RADAR_V
         
-        # [수정 사항 1] MSE Weight 추가 (Auxiliary Task)
-        # NLL이 Gradient Vanishing에 빠져도 위치(mu) 학습을 지속시키는 가이드 역할
-        self.mse_weight = 1.0  
-        
         # [수정 사항 2] Penalty 삭제
         # model.py에서 이미 Max Sigma 제한을 걸었으므로, 불필요한 규제 제거
         self.penalty_weight = 0.0
@@ -27,18 +23,12 @@ class SelfSupervisedLoss(nn.Module):
                 mu_r1, sig_r1, gt_r1, mask_idx_r1,
                 mu_r2, sig_r2, gt_r2, mask_idx_r2):
         
-        # 각 센서별로 NLL과 MSE를 계산하여 반환받음
-        l_l, mse_l = self._lidar_loss(mu_l, sig_l, gt_l, mask_idx_l)
-        l_r1, mse_r1 = self._radar_loss(mu_r1, sig_r1, gt_r1, mask_idx_r1)
-        l_r2, mse_r2 = self._radar_loss(mu_r2, sig_r2, gt_r2, mask_idx_r2)
+        # 각 센서별로 NLL만 계산하여 반환받음
+        l_l = self._lidar_loss(mu_l, sig_l, gt_l, mask_idx_l)
+        l_r1 = self._radar_loss(mu_r1, sig_r1, gt_r1, mask_idx_r1)
+        l_r2 = self._radar_loss(mu_r2, sig_r2, gt_r2, mask_idx_r2)
 
-        # [수정 사항 3] 최종 Loss 합산 로직 변경
-        # Total Loss = NLL(Aleatoric) + 1.0 * MSE(Mean Estimation)
-        loss_lidar = l_l + (self.mse_weight * mse_l)
-        loss_radar1 = l_r1 + (self.mse_weight * mse_r1)
-        loss_radar2 = l_r2 + (self.mse_weight * mse_r2)
-
-        total_loss = loss_lidar + loss_radar1 + loss_radar2
+        total_loss = l_l + l_r1 + l_r2
         
         # 로깅을 위해 분해된 값 반환
         return total_loss, l_l, l_r1, l_r2
@@ -46,7 +36,7 @@ class SelfSupervisedLoss(nn.Module):
     def _lidar_loss(self, mu, sigma, gt, mask_idx):
         # 마스킹 된 데이터가 없으면 0 반환
         if mask_idx is None or len(mask_idx) == 0:
-            return torch.tensor(0.0, device=self.device), torch.tensor(0.0, device=self.device)
+            return torch.tensor(0.0, device=self.device)
 
         pred = mu[mask_idx]
         sig = sigma[mask_idx]
@@ -60,16 +50,12 @@ class SelfSupervisedLoss(nn.Module):
         var = sig**2
         log_var = torch.log(var)
         nll_loss = (0.5 * err_sq / var) + (0.5 * log_var)
-        
-        # 2. MSE Loss (보조: 위치 추정 가이드)
-        # Sigma의 간섭 없이 순수하게 위치 오차만 계산
-        mse_loss = F.mse_loss(pred, target)
-        
-        return nll_loss.mean(), mse_loss
+
+        return nll_loss.mean()
 
     def _radar_loss(self, mu, sigma, gt, mask_idx):
         if mask_idx is None or len(mask_idx) == 0:
-            return torch.tensor(0.0, device=self.device), torch.tensor(0.0, device=self.device)
+            return torch.tensor(0.0, device=self.device)
 
         pred = mu[mask_idx]
         sig = sigma[mask_idx]
@@ -82,8 +68,5 @@ class SelfSupervisedLoss(nn.Module):
         var = sig**2
         log_var = torch.log(var)
         nll_loss = (0.5 * err_sq / var) + (0.5 * log_var)
-        
-        # 2. MSE Loss
-        mse_loss = F.mse_loss(pred, target)
-        
-        return nll_loss.mean(), mse_loss
+
+        return nll_loss.mean()

@@ -12,7 +12,7 @@ import wandb
 from .config import ModelConfig, load_yaml_config, parse_versions, apply_yaml_to_cfg
 from .data import MultiRunTextWindowDataset, collate_fn
 from .graph import GraphBuilder
-from .infer import infer_export
+from .infer_export import infer_export
 from .loss import UncertaintyLoss
 from .model import DOGMSTGATUncertaintyNet
 from .train_eval import train_one_epoch, eval_one_epoch
