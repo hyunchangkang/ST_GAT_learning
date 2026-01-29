@@ -27,13 +27,12 @@ class SingleSequenceDataset(Dataset):
         self.radar2_df = pd.read_csv(os.path.join(data_root, "Basescan", f"Radar2Map_BaseScan_{ver}.txt"), sep='\s+', header=None, names=['t', 'x', 'y', 'vr', 'SNR'])
         self.odom_df = pd.read_csv(os.path.join(data_root, f"odom_filtered_{ver}.txt"), sep='\s+', header=None, names=['t', 'x', 'y', 'yaw', 'v', 'w'])
         
-        # Timestamp binning (0.1s interval) to handle jitter
+        # Timestamp binning (0.1s interval)
         self.ts = sorted(self.lidar_df['t'].round(1).unique())
         
-        # [수정] Valid indices
-        # 기존: range(window_size - 1, len(self.ts) - 1) -> t+1을 위해 마지막 하나를 남겨둠
-        # 변경: range(window_size - 1, len(self.ts))     -> t 시점 복원이므로 마지막 프레임까지 다 씀
-        self.indices = range(window_size - 1, len(self.ts))
+        # [수정] t+1 시점 데이터를 GT로 사용하므로, 마지막 프레임은 학습 불가능 (t+1이 없음)
+        # 따라서 범위를 하나 줄입니다.
+        self.indices = range(window_size - 1, len(self.ts) - 1)
 
         # Empirical scaling
         self.scale_pose = 10.0
@@ -55,16 +54,19 @@ class SingleSequenceDataset(Dataset):
     def __getitem__(self, idx):
         # Current window ends at t
         current_idx = self.indices[idx]
-        base_t = self.ts[current_idx]      # Current frame for coordinate base (t)
-        
-        # [수정] target_t (t+1) 삭제됨
+        base_t = self.ts[current_idx]      # Current frame (t)
+        next_t = self.ts[current_idx + 1]  # Future frame (t+1)
         
         window_ts = self.ts[current_idx - self.window_size + 1 : current_idx + 1]
-        T_inv_base = np.linalg.inv(self.get_T(base_t))
+        
+        T_base = self.get_T(base_t)
+        T_inv_base = np.linalg.inv(T_base)
         
         data = HeteroData()
 
-        # Input data construction (t-3 ~ t)
+        # =========================================================
+        # 1. Input Data Construction (t-3 ~ t)
+        # =========================================================
         for key, df, dim in [('lidar', self.lidar_df, 4), ('radar1', self.radar1_df, 5), ('radar2', self.radar2_df, 5)]:
             pts_list = []
             for t_bin in window_ts:
@@ -75,10 +77,9 @@ class SingleSequenceDataset(Dataset):
                     xy_h = np.hstack([curr[:, 1:3], np.ones((len(curr), 1))])
                     trans_xy = (T_rel @ xy_h.T).T[:, :2] / self.scale_pose 
                     
-                    dt_val = round(base_t - t_bin, 1) # Relative time (0.0, 0.1, 0.2, 0.3)
+                    dt_val = round(base_t - t_bin, 1) # Relative time
                     features = curr[:, 3:].copy()
                     
-                    # Feature scaling (No masking applied to current frame dt=0)
                     if key == 'lidar':
                         features[:, 0] = np.clip(features[:, 0] / self.scale_lidar_i, 0, 1)
                     else:
@@ -92,14 +93,52 @@ class SingleSequenceDataset(Dataset):
                 res = np.vstack(pts_list)
                 data[key].x = torch.tensor(res, dtype=torch.float)
                 data[key].pos = torch.tensor(res[:, :2], dtype=torch.float)
-                # dt info is stored in the last column of x for edge filtering in utils.py
             else:
                 data[key].x, data[key].pos = torch.empty((0, dim)), torch.empty((0, 2))
 
-        # [수정] Ground Truth construction (t+1) 로직 전체 삭제
-        # 이제 모델은 t 시점의 데이터를 마스킹하고 복원하는 것이 목표이므로, 
-        # t+1 데이터는 필요하지 않음.
+        # =========================================================
+        # 2. GT Data Construction (t+1 transformed to t frame)
+        # [중요] GT 포인트들도 PyG의 'Node'로 정의하여 Batch 처리를 지원하게 함
+        # =========================================================
         
+        T_next = self.get_T(next_t)
+        # Transform from (t+1) global to (t) local
+        # P_t = T_base_inv * T_next * P_next
+        T_next_to_base = T_inv_base @ T_next
+
+        # (1) LiDAR GT (for Geometric Consistency)
+        l_next = self.lidar_df[self.lidar_df['t'].round(1) == round(next_t, 1)].values
+        if len(l_next) > 0:
+            xy_h = np.hstack([l_next[:, 1:3], np.ones((len(l_next), 1))])
+            trans_xy = (T_next_to_base @ xy_h.T).T[:, :2] / self.scale_pose
+            
+            data['gt_lidar'].pos = torch.tensor(trans_xy, dtype=torch.float)
+            # Dummy feature x required for PyG batching mechanism
+            data['gt_lidar'].x = torch.zeros((len(trans_xy), 1), dtype=torch.float)
+        else:
+            data['gt_lidar'].pos = torch.empty((0, 2))
+            data['gt_lidar'].x = torch.empty((0, 1))
+
+        # (2) Radar GT (Radar1 + Radar2 Merged for Ghost Filtering)
+        r_next_list = []
+        for rdf in [self.radar1_df, self.radar2_df]:
+            r_val = rdf[rdf['t'].round(1) == round(next_t, 1)].values
+            if len(r_val) > 0: r_next_list.append(r_val[:, 1:3])
+        
+        if r_next_list:
+            r_next_all = np.vstack(r_next_list)
+            xy_h = np.hstack([r_next_all, np.ones((len(r_next_all), 1))])
+            trans_xy = (T_next_to_base @ xy_h.T).T[:, :2] / self.scale_pose
+            
+            data['gt_radar'].pos = torch.tensor(trans_xy, dtype=torch.float)
+            data['gt_radar'].x = torch.zeros((len(trans_xy), 1), dtype=torch.float)
+        else:
+            data['gt_radar'].pos = torch.empty((0, 2))
+            data['gt_radar'].x = torch.empty((0, 1))
+            
+        # Delta Time (Scalar)
+        data['dt_sec'] = torch.tensor([round(next_t - base_t, 1)], dtype=torch.float)
+
         return data
 
 def get_selected_dataset(root, vers, win):

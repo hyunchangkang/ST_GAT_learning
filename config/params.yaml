@@ -36,26 +36,26 @@ target_versions:
   - "v14"
 
 train_versions:  
-  # - "v1"
-  # - "v2"
-  # - "v3"
-  # - "v4"
-  # - "v5"
-  # - "v6"
-  # - "v7"
+  - "v1"
+  - "v2"
+  - "v3"
+  - "v4"
+  - "v5"
+  - "v6"
+  - "v7"
   - "v8"
-  # - "v9"
-  # - "v10"
+  - "v9"
+  - "v10"
   # - "v11"
   # - "v12"
-  # - "v13"
-  # - "v14"
+  - "v13"
+  - "v14"
 
 val_versions:    
   # - "v3"
-  - "v8"
+  - "v11"
 
-inference_version: "v8"
+inference_version: "v12"
 
 model_path: "output/best_model.pth"  
 
@@ -75,14 +75,23 @@ temporal_radius_ll: 0.15
 temporal_radius_rr: 0.15
 
 min_sigma_lidar_m: 0.03   
-max_sigma_lidar_m: 0.2   
+max_sigma_lidar_m: 0.5   
 
-min_sigma_radar_v: 0.05   
-max_sigma_radar_v: 1.5    
+# min_sigma_radar_pos_m: 0.05
+# max_sigma_radar_pos_m: 2.0
 
+min_sigma_radar_v: 0.10   
+max_sigma_radar_v: 3.0    
 
 max_num_neighbors_lidar: 32  
 max_num_neighbors_radar: 16 
+
+# 4. Weight
+lambda_lidar_loss: 1.0
+lambda_radar_loss: 1.0
+
+lambda_radar_temporal_loss: 1.0
+lambda_radar_spatial_loss: 0.02
 
 # 4. Training
 batch_size: 16         # Batch Size
