@@ -12,18 +12,14 @@ class SpatiotemporalUncertaintyLoss(nn.Module):
         self.SCALE_POSE = 10.0
         self.SCALE_RADAR_V = 5.0
         
-        # =========================================================
-        # [Config] Weights (Lambda) Setup
-        # =========================================================
+        # Weights (Lambda)
         self.w_lidar = float(config.get('lambda_lidar_loss', 1.0))
         self.w_radar = float(config.get('lambda_radar_loss', 1.0))
-        
+        self.w_l_intensity = float(config.get('lambda_lidar_intensity', 1.0))
         self.w_r_temp = float(config.get('lambda_radar_temporal_loss', 1.0))
         self.w_r_spat = float(config.get('lambda_radar_spatial_loss', 0.1)) 
 
-        # =========================================================
-        # [Config] Clamping Limits
-        # =========================================================
+        # Clamping
         min_l = float(config.get('min_sigma_lidar_m', 0.03)) 
         max_l = float(config.get('max_sigma_lidar_m', 0.2))
         self.L_MIN = 2 * math.log(min_l / self.SCALE_POSE + 1e-9)
@@ -36,72 +32,48 @@ class SpatiotemporalUncertaintyLoss(nn.Module):
 
         self.GHOST_PENALTY_VAL = 2.0 
 
-        print(f"[Loss] Init Complete.")
-        print(f"       Weights -> LiDAR: {self.w_lidar}, RadarTotal: {self.w_radar}")
-        print(f"       Radar Internal -> Temporal: {self.w_r_temp}, Spatial: {self.w_r_spat}")
+        print(f"[Loss] Init Complete. LiDAR: Local Trend Consistency Mode.")
 
     def forward(self, outputs, batch, dt, edge_index_dict):
         total_loss = 0
         log_metrics = {}
-        
         safe_dt = dt if dt > 0.01 else 0.1
-
-        # [Debug: PyG 객체는 딕셔너리처럼 검사해야 합니다]
-        # has_gt = 'gt_lidar' in batch.node_types  # <-- 이 방식이 정확합니다.
         
         # =========================================================
-        # 1. LiDAR Loss
+        # 1. LiDAR Loss: Local Trend Consistency at time t
         # =========================================================
-        # [수정] hasattr 대신 'in' 연산자 사용
-        has_gt_lidar = 'gt_lidar' in batch.node_types
-        has_pred_lidar = 'lidar' in batch.node_types and batch['lidar'].x.size(0) > 0
-        
-        if has_gt_lidar and has_pred_lidar:
-            # GT 데이터가 있어도 비어있을 수 있으므로 size 체크
-            if batch['gt_lidar'].pos.size(0) > 0:
-                pred_disp, log_var_pos = outputs['lidar']
-                curr_pos = batch['lidar'].pos
-                gt_pos = batch['gt_lidar'].pos
-                
-                log_var_pos = torch.clamp(log_var_pos, min=self.L_MIN, max=self.L_MAX)
-                pred_next = curr_pos + pred_disp
-                
-                batch_size = int(batch['lidar'].batch.max().item()) + 1
-                l_loss_sum = 0
-                count = 0
-                
-                for b in range(batch_size):
-                    mask_p = (batch['lidar'].batch == b)
-                    mask_g = (batch['gt_lidar'].batch == b)
+        if 'lidar' in batch.node_types and batch['lidar'].x.size(0) > 0:
+            # Model output is only log_var_pos (Sigma)
+            log_var_pos = outputs['lidar'] 
+            curr_pos = batch['lidar'].pos 
+            curr_int = batch['lidar'].x[:, 2:3] # Raw Intensity
+            
+            log_var_pos = torch.clamp(log_var_pos, min=self.L_MIN, max=self.L_MAX)
+            spatial_edge_key = ('lidar', 'spatial', 'lidar')
+            
+            if spatial_edge_key in edge_index_dict:
+                edge_index = edge_index_dict[spatial_edge_key]
+                if edge_index.numel() > 0:
+                    src, dst = edge_index[0], edge_index[1]
+                    num_nodes = curr_pos.size(0)
                     
-                    p_b = pred_next[mask_p]
-                    g_b = gt_pos[mask_g]
-                    lv_b = log_var_pos[mask_p]
+                    # Compute neighbor means (Trends)
+                    mean_pos_nb = scatter_mean(curr_pos[src], dst, dim=0, dim_size=num_nodes)
+                    mean_int_nb = scatter_mean(curr_int[src], dst, dim=0, dim_size=num_nodes)
                     
-                    if p_b.size(0) == 0 or g_b.size(0) == 0: continue
+                    # Residuals: Deviation from local geometric & intensity trend
+                    spatial_res_sq = torch.sum((curr_pos - mean_pos_nb)**2, dim=1, keepdim=True)
+                    intensity_res_sq = (curr_int - mean_int_nb)**2
+                    combined_res_sq = spatial_res_sq + (self.w_l_intensity * intensity_res_sq)
                     
-                    d_mat = torch.cdist(p_b, g_b)
-                    min_dist, _ = torch.min(d_mat, dim=1, keepdim=True)
-                    dist_sq = min_dist ** 2 
+                    # Self-supervised NLL Loss
+                    precision = torch.exp(-log_var_pos)
+                    l_nll = 0.5 * precision * combined_res_sq + 0.5 * log_var_pos
                     
-                    precision = torch.exp(-lv_b)
-                    nll = 0.5 * precision * dist_sq + 0.5 * lv_b
-                    mse = dist_sq
-                    
-                    l_loss_sum += (nll + mse).sum()
-                    count += p_b.size(0)
-                
-                if count > 0:
-                    raw_l_loss = l_loss_sum / count
-                    weighted_l_loss = raw_l_loss * self.w_lidar
-                    
+                    weighted_l_loss = torch.mean(l_nll) * self.w_lidar
                     total_loss += weighted_l_loss
                     log_metrics['loss_lidar'] = weighted_l_loss.item()
-                else:
-                    # 매칭되는 포인트가 하나도 없는 경우
-                    log_metrics['loss_lidar'] = 0.0
-            else:
-                 log_metrics['loss_lidar'] = 0.0
+                    log_metrics['lidar_sigma_mean'] = torch.exp(0.5 * log_var_pos).mean().item()
 
         # =========================================================
         # 2. Radar Loss

@@ -122,11 +122,9 @@ def plot_results():
             edgecolors='none'
         )
 
-    # Radar first (Background)
+    plot_sensor('lidar', 'o', 3, 5.0)
     plot_sensor('radar1', '^', 2, 30.0)
     plot_sensor('radar2', 'v', 2, 30.0)
-    # LiDAR (Foreground)
-    plot_sensor('lidar', 'o', 3, 2.0)
 
     # ==========================================
     # 6. Finalize

@@ -40,18 +40,16 @@ def inference():
     SCALE_POSE = 10.0    
     SCALE_RADAR_V = 5.0 
 
-    # [Clamping Limits Setup] - Loss.py와 동일한 로직 필수!
+    # [수정] 박사님 요청대로 YAML(params.yaml)의 값을 그대로 사용하도록 복구합니다.
     # 1. LiDAR Limits (m)
     min_l = float(cfg.get('min_sigma_lidar_m', 0.03))
     max_l = float(cfg.get('max_sigma_lidar_m', 0.2))
-    # Log Space Limits
     L_MIN = 2 * math.log(min_l / SCALE_POSE + 1e-9)
     L_MAX = 2 * math.log(max_l / SCALE_POSE + 1e-9)
 
     # 2. Radar Limits (m/s)
     min_r = float(cfg.get('min_sigma_radar_v', 0.10))
-    max_r = float(cfg.get('max_sigma_radar_v', 5.0))
-    # Log Space Limits
+    max_r = float(cfg.get('max_sigma_radar_v', 5.0)) # 원래 코드의 기본값 5.0 복구
     R_MIN = 2 * math.log(min_r / SCALE_RADAR_V + 1e-9)
     R_MAX = 2 * math.log(max_r / SCALE_RADAR_V + 1e-9)
 
@@ -85,11 +83,7 @@ def inference():
         temporal_radius_ll=float(cfg.get('temporal_radius_ll', 0.15)) / SCALE_POSE,
         temporal_radius_rr=float(cfg.get('temporal_radius_rr', 0.15)) / SCALE_POSE,
         max_num_neighbors_lidar=int(cfg.get('max_num_neighbors_lidar', 16)),
-        max_num_neighbors_radar=int(cfg.get('max_num_neighbors_radar', 32)),
-        scale_pose=SCALE_POSE,
-        scale_radar_v=SCALE_RADAR_V,
-        min_sigma_lidar_m=min_l, max_sigma_lidar_m=max_l,
-        min_sigma_radar_v=min_r, max_sigma_radar_v=max_r
+        max_num_neighbors_radar=int(cfg.get('max_num_neighbors_radar', 32))
     ).to(device)
 
     # Load Weights
@@ -116,26 +110,22 @@ def inference():
         for idx, batch_data in enumerate(tqdm(loader)):
             batch_data = batch_data.to(device)
 
-            # Edge 정보 없이 추론 (inference 모드)
+            # [수정] LiDAR 헤드 출력이 1ch이므로 언패킹 제거
             outputs, _ = model(batch_data)
             
             # --- LiDAR Output ---
-            if batch_data['lidar'].x.size(0) > 0:
-                pred_disp, log_var_pos_l = outputs['lidar']
+            if 'lidar' in outputs and batch_data['lidar'].x.size(0) > 0:
+                log_var_pos_l = outputs['lidar']
                 
-                # [핵심] Clamp Log Variance (Safety Lock)
+                # [핵심] Clamp Log Variance
                 log_var_pos_l = torch.clamp(log_var_pos_l, min=L_MIN, max=L_MAX)
                 
-                # Physical Conversion
-                # sigma_norm = exp(0.5 * log_var)
-                # sigma_meter = sigma_norm * SCALE
                 sig_norm_scale_l = torch.exp(0.5 * log_var_pos_l)
                 sig_phys_l = sig_norm_scale_l * SCALE_POSE # Unit: Meters
                 
                 # Normalize for Plot (0~1)
                 sig_norm_l = norm01(sig_phys_l, min_l, max_l)
                 
-                # Save Current Frame
                 curr_mask_l = (batch_data['lidar'].x[:, -1] == 0)
                 local_pos_l = batch_data['lidar'].pos
                 
@@ -152,23 +142,19 @@ def inference():
                     p_curr_h = torch.cat([p_curr_m, ones], dim=1)
                     global_pos = (T_base @ p_curr_h.T).T[:, :2]
                     
-                    # [x, y, sigma(m), sigma_norm]
                     res = torch.cat([global_pos, s_phys, s_norm], dim=1)
                     result_buffers['lidar'].append(res.cpu().numpy())
 
             # --- Radar Output ---
             for r_key in ['radar1', 'radar2']:
-                if batch_data[r_key].x.size(0) > 0:
+                if r_key in outputs and batch_data[r_key].x.size(0) > 0:
                     log_var_vel_r = outputs[r_key]
                     
-                    # [핵심] Clamp Log Variance (Safety Lock)
                     log_var_vel_r = torch.clamp(log_var_vel_r, min=R_MIN, max=R_MAX)
                     
-                    # Physical Conversion (Velocity Sigma)
                     sig_norm_scale_r = torch.exp(0.5 * log_var_vel_r)
                     sig_phys_r = sig_norm_scale_r * SCALE_RADAR_V # Unit: m/s
                     
-                    # Normalize for Plot (0~1)
                     sig_norm_r = norm01(sig_phys_r, min_r, max_r)
                     
                     curr_mask_r = (batch_data[r_key].x[:, -1] == 0)
@@ -187,7 +173,6 @@ def inference():
                         p_curr_h = torch.cat([p_curr_m, ones], dim=1)
                         global_pos = (T_base @ p_curr_h.T).T[:, :2]
                         
-                        # [x, y, sigma(m/s), sigma_norm]
                         res = torch.cat([global_pos, s_phys, s_norm], dim=1)
                         result_buffers[r_key].append(res.cpu().numpy())
 
@@ -198,16 +183,11 @@ def inference():
     if not os.path.exists(save_dir):
         os.makedirs(save_dir)
     
-    print(f"[Inference] Saving results to {save_dir}...")
-
     for key, buffer in result_buffers.items():
         if buffer:
             final_array = np.vstack(buffer)
             save_path = os.path.join(save_dir, f"Result_{key}_{target_vers}.txt")
-            
-            # Format: x y sigma_phys sigma_norm
             header = 'x y sigma sigma_norm'
-            
             np.savetxt(save_path, final_array, fmt='%.4f', delimiter=' ', header=header, comments='')
             print(f"[*] Saved: {save_path} (Shape: {final_array.shape})")
 
