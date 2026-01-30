@@ -7,9 +7,9 @@ from src.utils import build_graph
 
 class ST_HGAT(nn.Module):
     def __init__(self, hidden_dim, num_layers, heads, metadata, node_in_dims, 
-                 radius_ll=0.25, radius_rr=1.5, radius_cross=0.6, 
-                 temporal_radius_ll=0.6, temporal_radius_rr=0.8,
-                 max_num_neighbors_lidar=16, max_num_neighbors_radar=32, **kwargs):
+                 radius_ll, radius_rr, radius_cross, 
+                 temporal_radius_ll, temporal_radius_rr,
+                 max_num_neighbors_lidar, max_num_neighbors_radar, **kwargs):
         
         super(ST_HGAT, self).__init__()
         
@@ -17,6 +17,14 @@ class ST_HGAT(nn.Module):
         self.num_layers = num_layers
         self.heads = heads
         self.node_types, self.edge_types = metadata
+
+        self.radius_ll = radius_ll
+        self.radius_rr = radius_rr
+        self.radius_cross = radius_cross
+        self.temporal_radius_ll = temporal_radius_ll
+        self.temporal_radius_rr = temporal_radius_rr
+        self.max_Lnum = max_num_neighbors_lidar
+        self.max_Rnum = max_num_neighbors_radar
 
         # Calculate head dimension and actual hidden dimension for stability
         self.head_dim = hidden_dim // heads
@@ -48,22 +56,24 @@ class ST_HGAT(nn.Module):
         self.head_radar = nn.Linear(self.actual_hidden, 1)
 
     def forward(self, data: HeteroData):
-        # 1. Build Graph
+        # 1. Build Graph: Using dynamic parameters from config
         edge_index_dict, edge_attr_dict = build_graph(
-            data, 0.25/10.0, 1.5/10.0, 0.6/10.0, 0.15/10.0, 0.15/10.0, 16, 32, data['lidar'].x.device
+            data, self.radius_ll, self.radius_rr, self.radius_cross,
+            self.temporal_radius_ll, self.temporal_radius_rr,
+            self.max_Lnum, self.max_Rnum, data['lidar'].x.device
         )
 
-        # 2. Process
-        x_dict = {}
-        for nt in self.node_types:
-            x_dict[nt] = F.elu(self.proj_dict[nt](data[nt].x))
+        x_dict = {nt: F.elu(self.proj_dict[nt](data[nt].x)) for nt in self.node_types}
 
         for i in range(self.num_layers):
-            # Check for empty graph to prevent GATv2 crash
-            if len(edge_index_dict) > 0:
-                x_dict = self.convs[i](x_dict, edge_index_dict, edge_attr_dict)
+            # Guard: HeteroConv might skip node types with no edges
+            new_x_dict = self.convs[i](x_dict, edge_index_dict, edge_attr_dict)
             
             for nt in self.node_types:
+                # Update only if node type exists in conv output; else keep previous features
+                if nt in new_x_dict:
+                    x_dict[nt] = new_x_dict[nt]
+                
                 if x_dict[nt].size(0) > 0:
                     x_dict[nt] = F.elu(x_dict[nt])
                     x_dict[nt] = F.dropout(x_dict[nt], p=0.0, training=self.training)

@@ -31,25 +31,24 @@ def inference():
     target_vers = cfg.get('inference_version', "v11")
     print(f"[Inference] Target Version: {target_vers}")
 
+    # Load dataset with the same window_size as training
     dataset = get_selected_dataset(cfg['data_root'], [target_vers], cfg['window_size'])
     inner_dataset = dataset.datasets[0]
     
     loader = DataLoader(dataset, batch_size=1, shuffle=False, collate_fn=custom_collate)
 
-    # Scaling Factors (Train과 동일)
+    # Scaling Factors: Must match loss.py exactly
     SCALE_POSE = 10.0    
     SCALE_RADAR_V = 5.0 
 
-    # [수정] 박사님 요청대로 YAML(params.yaml)의 값을 그대로 사용하도록 복구합니다.
-    # 1. LiDAR Limits (m)
+    # [Stability] Clamping Limits: Derived from YAML for physical consistency
     min_l = float(cfg.get('min_sigma_lidar_m', 0.03))
     max_l = float(cfg.get('max_sigma_lidar_m', 0.2))
     L_MIN = 2 * math.log(min_l / SCALE_POSE + 1e-9)
     L_MAX = 2 * math.log(max_l / SCALE_POSE + 1e-9)
 
-    # 2. Radar Limits (m/s)
     min_r = float(cfg.get('min_sigma_radar_v', 0.10))
-    max_r = float(cfg.get('max_sigma_radar_v', 5.0)) # 원래 코드의 기본값 5.0 복구
+    max_r = float(cfg.get('max_sigma_radar_v', 5.0))
     R_MIN = 2 * math.log(min_r / SCALE_RADAR_V + 1e-9)
     R_MAX = 2 * math.log(max_r / SCALE_RADAR_V + 1e-9)
 
@@ -71,6 +70,7 @@ def inference():
     raw_sample = dataset[0]
     node_in_dims = {nt: raw_sample[nt].x.size(1) for nt in node_types}
 
+    # Instantiate model with dynamic radius parameters
     model = ST_HGAT(
         hidden_dim=cfg['hidden_dim'],
         num_layers=cfg['num_layers'],
@@ -86,7 +86,7 @@ def inference():
         max_num_neighbors_radar=int(cfg.get('max_num_neighbors_radar', 32))
     ).to(device)
 
-    # Load Weights
+    # Load Trained Weights
     model_path = os.path.join(cfg['save_dir'], "best_model.pth")
     if not os.path.exists(model_path):
         print(f"[Error] Model not found at {model_path}")
@@ -110,76 +110,61 @@ def inference():
         for idx, batch_data in enumerate(tqdm(loader)):
             batch_data = batch_data.to(device)
 
-            # [수정] LiDAR 헤드 출력이 1ch이므로 언패킹 제거
+            # [Update] model internally calls the dynamic build_graph
             outputs, _ = model(batch_data)
             
-            # --- LiDAR Output ---
+            # --- LiDAR Uncertainty Recovery ---
             if 'lidar' in outputs and batch_data['lidar'].x.size(0) > 0:
-                log_var_pos_l = outputs['lidar']
+                log_var_pos_l = torch.clamp(outputs['lidar'], min=L_MIN, max=L_MAX) #
                 
-                # [핵심] Clamp Log Variance
-                log_var_pos_l = torch.clamp(log_var_pos_l, min=L_MIN, max=L_MAX)
-                
-                sig_norm_scale_l = torch.exp(0.5 * log_var_pos_l)
-                sig_phys_l = sig_norm_scale_l * SCALE_POSE # Unit: Meters
-                
-                # Normalize for Plot (0~1)
+                # Recover physical sigma (m) from log-variance
+                sig_phys_l = torch.exp(0.5 * log_var_pos_l) * SCALE_POSE 
                 sig_norm_l = norm01(sig_phys_l, min_l, max_l)
                 
-                curr_mask_l = (batch_data['lidar'].x[:, -1] == 0)
+                # Extract only the current frame (dt == 0)
+                curr_mask_l = (batch_data['lidar'].x[:, -1].abs() < 0.05)
                 local_pos_l = batch_data['lidar'].pos
                 
                 if curr_mask_l.any():
                     base_t = timestamps[inner_dataset.indices[idx]]
                     T_base = torch.tensor(inner_dataset.get_T(base_t), dtype=torch.float, device=device)
                     
-                    p_curr = local_pos_l[curr_mask_l]
-                    s_phys = sig_phys_l[curr_mask_l]
-                    s_norm = sig_norm_l[curr_mask_l]
-                    
-                    p_curr_m = p_curr * SCALE_POSE
-                    ones = torch.ones(p_curr.size(0), 1, device=device)
+                    p_curr_m = local_pos_l[curr_mask_l] * SCALE_POSE
+                    ones = torch.ones(p_curr_m.size(0), 1, device=device)
                     p_curr_h = torch.cat([p_curr_m, ones], dim=1)
-                    global_pos = (T_base @ p_curr_h.T).T[:, :2]
+                    global_pos = (T_base @ p_curr_h.T).T[:, :2] # Global transformation
                     
-                    res = torch.cat([global_pos, s_phys, s_norm], dim=1)
+                    res = torch.cat([global_pos, sig_phys_l[curr_mask_l], sig_norm_l[curr_mask_l]], dim=1)
                     result_buffers['lidar'].append(res.cpu().numpy())
 
-            # --- Radar Output ---
+            # --- Radar Uncertainty Recovery ---
             for r_key in ['radar1', 'radar2']:
                 if r_key in outputs and batch_data[r_key].x.size(0) > 0:
-                    log_var_vel_r = outputs[r_key]
+                    log_var_vel_r = torch.clamp(outputs[r_key], min=R_MIN, max=R_MAX) #
                     
-                    log_var_vel_r = torch.clamp(log_var_vel_r, min=R_MIN, max=R_MAX)
-                    
-                    sig_norm_scale_r = torch.exp(0.5 * log_var_vel_r)
-                    sig_phys_r = sig_norm_scale_r * SCALE_RADAR_V # Unit: m/s
-                    
+                    # Recover physical sigma (m/s)
+                    sig_phys_r = torch.exp(0.5 * log_var_vel_r) * SCALE_RADAR_V
                     sig_norm_r = norm01(sig_phys_r, min_r, max_r)
                     
-                    curr_mask_r = (batch_data[r_key].x[:, -1] == 0)
+                    curr_mask_r = (batch_data[r_key].x[:, -1].abs() < 0.05)
                     local_pos_r = batch_data[r_key].pos
                     
                     if curr_mask_r.any():
                         base_t = timestamps[inner_dataset.indices[idx]]
                         T_base = torch.tensor(inner_dataset.get_T(base_t), dtype=torch.float, device=device)
                         
-                        p_curr = local_pos_r[curr_mask_r]
-                        s_phys = sig_phys_r[curr_mask_r]
-                        s_norm = sig_norm_r[curr_mask_r]
-                        
-                        p_curr_m = p_curr * SCALE_POSE
-                        ones = torch.ones(p_curr.size(0), 1, device=device)
+                        p_curr_m = local_pos_r[curr_mask_r] * SCALE_POSE
+                        ones = torch.ones(p_curr_m.size(0), 1, device=device)
                         p_curr_h = torch.cat([p_curr_m, ones], dim=1)
                         global_pos = (T_base @ p_curr_h.T).T[:, :2]
                         
-                        res = torch.cat([global_pos, s_phys, s_norm], dim=1)
+                        res = torch.cat([global_pos, sig_phys_r[curr_mask_r], sig_norm_r[curr_mask_r]], dim=1)
                         result_buffers[r_key].append(res.cpu().numpy())
 
     # ==========================================
-    # 5. Save Results
+    # 5. Save Results (x, y, sigma_phys, sigma_norm)
     # ==========================================
-    save_dir = "/mnt/samsung_ssd/hyunchang/inference_results"
+    save_dir = cfg.get('inference_save_dir', "/mnt/samsung_ssd/hyunchang/inference_results")
     if not os.path.exists(save_dir):
         os.makedirs(save_dir)
     

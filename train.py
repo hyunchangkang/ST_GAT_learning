@@ -80,6 +80,7 @@ def train():
     metadata = (node_types, edge_types)
     node_in_dims = {nt: dummy_batch[nt].x.size(1) for nt in node_types}
 
+    # [수정] 모델 생성자 인자를 ST_HGAT 정의에 맞춰 정렬
     model = ST_HGAT(
         hidden_dim=cfg["hidden_dim"],
         num_layers=cfg["num_layers"],
@@ -92,18 +93,23 @@ def train():
         temporal_radius_ll=cfg.get("temporal_radius_ll", 0.15) / SCALE_POSE,
         temporal_radius_rr=cfg.get("temporal_radius_rr", 0.15) / SCALE_POSE,
         max_num_neighbors_lidar=cfg.get("max_num_neighbors_lidar", 16),
-        max_num_neighbors_radar=cfg.get("max_num_neighbors_radar", 32),
-        min_sigma_lidar_m=cfg.get("min_sigma_lidar_m"), 
-        max_sigma_lidar_m=cfg.get("max_sigma_lidar_m"),
-        min_sigma_radar_v=cfg.get("min_sigma_radar_v"), 
-        max_sigma_radar_v=cfg.get("max_sigma_radar_v"),
-        scale_pose=SCALE_POSE,
-        scale_radar_v=SCALE_RADAR_V,
+        max_num_neighbors_radar=cfg.get("max_num_neighbors_radar", 32)
     ).to(device)
 
     optimizer = optim.Adam(model.parameters(), lr=float(cfg["learning_rate"]), weight_decay=float(cfg["weight_decay"]))
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=10)
+    
+
     criterion = SpatiotemporalUncertaintyLoss(device, cfg)
+
+    with torch.no_grad():
+        # LiDAR 중간값 계산 및 주입
+        lidar_init_bias = (criterion.L_MIN + criterion.L_MAX) / 2
+        model.head_lidar.bias.fill_(lidar_init_bias)
+        
+        # Radar 중간값 계산 및 주입
+        radar_init_bias = (criterion.R_MIN + criterion.R_MAX) / 2
+        model.head_radar.bias.fill_(radar_init_bias)
 
     best_val_loss = float("inf")
     patience = int(cfg.get("patience", 10))
@@ -113,53 +119,46 @@ def train():
     # 5. Training Loop
     # ====================================================
     for epoch in range(int(cfg["epochs"])):
-        # ------------------------------------------------
-        # [Phase 1] Training
-        # ------------------------------------------------
         model.train()
         total_train_loss = 0.0
         updates = 0
         
-        # [수정] 박사님이 원하시는 Total Loss까지 포함한 누적 딕셔너리
         metrics_accum = {
             'loss_lidar': 0.0,
-            
-            'radar1_loss_total': 0.0,
-            'radar1_loss_temporal': 0.0,
-            'radar1_loss_spatial': 0.0,
-            
-            'radar2_loss_total': 0.0,
-            'radar2_loss_temporal': 0.0,
-            'radar2_loss_spatial': 0.0
+            'lidar_spatial_loss': 0.0,   
+            'lidar_intensity_loss': 0.0, 
+            'radar1_loss_total': 0.0, 'radar1_loss_temporal': 0.0, 'radar1_loss_spatial': 0.0,
+            'radar2_loss_total': 0.0, 'radar2_loss_temporal': 0.0, 'radar2_loss_spatial': 0.0
         }
 
-        loop = tqdm(train_loader, desc=f"Ep {epoch+1} [Train]")
+        loop = tqdm(train_loader, desc=f"[Train] Epoch {epoch+1}")
 
         for batch in loop:
             batch = batch.to(device)
-            dt = batch.dt_sec[0] 
+            # [수정] dt = batch.dt_sec[0] 제거 (loss.py에서 개별 처리)
 
             optimizer.zero_grad()
             outputs, edge_index_dict = model(batch)
-            loss, log_metrics = criterion(outputs, batch, dt, edge_index_dict)
+            
+            # [수정] 인자 3개로 호출 (outputs, batch, edge_index_dict)
+            loss, log_metrics = criterion(outputs, batch, edge_index_dict)
 
-            if loss.item() != 0.0:
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                optimizer.step()
+            
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
 
-                total_train_loss += loss.item()
-                updates += 1
+            total_train_loss += loss.item()
+            updates += 1
                 
-                # 키가 일치하는 것만 누적
-                for k in metrics_accum.keys():
-                    if k in log_metrics:
-                        metrics_accum[k] += log_metrics[k]
+            for k in metrics_accum.keys():
+                if k in log_metrics:
+                    metrics_accum[k] += log_metrics[k]
 
             loop.set_postfix(loss=f"{loss.item():.4f}")
 
-        # 평균 계산
-        avg_train_loss = total_train_loss / max(updates, 1)
+        # [수정] Division 로직: 업데이트가 없으면 inf로 설정하여 오판 방지
+        avg_train_loss = total_train_loss / updates if updates > 0 else float('inf')
         for k in metrics_accum:
             metrics_accum[k] /= max(updates, 1)
 
@@ -170,53 +169,46 @@ def train():
         total_val_loss = 0.0
         val_updates = 0
         
-        # Validation용 누적 딕셔너리 초기화
-        val_metrics_accum = {
-            'loss_lidar': 0.0,
-            
-            'radar1_loss_total': 0.0,
-            'radar1_loss_temporal': 0.0,
-            'radar1_loss_spatial': 0.0,
-            
-            'radar2_loss_total': 0.0,
-            'radar2_loss_temporal': 0.0,
-            'radar2_loss_spatial': 0.0
-        }
+        val_metrics_accum = {k: 0.0 for k in metrics_accum.keys()}
 
         with torch.no_grad():
             for batch in val_loader:
                 batch = batch.to(device)
-                dt = batch.dt_sec[0]
                 outputs, edge_index_dict = model(batch)
-                loss, log_metrics = criterion(outputs, batch, dt, edge_index_dict)
+                loss, log_metrics = criterion(outputs, batch, edge_index_dict)
 
-                if loss.item() != 0.0:
-                    total_val_loss += loss.item()
-                    val_updates += 1
-                    
-                    for k in val_metrics_accum.keys():
-                        if k in log_metrics:
-                            val_metrics_accum[k] += log_metrics[k]
 
-        avg_val_loss = total_val_loss / max(val_updates, 1)
+                total_val_loss += loss.item()
+                val_updates += 1
+                for k in val_metrics_accum.keys():
+                    if k in log_metrics:
+                        val_metrics_accum[k] += log_metrics[k]
+
+        # [수정] Division 로직: 업데이트가 없으면 inf로 설정
+        avg_val_loss = total_val_loss / val_updates if val_updates > 0 else float('inf')
         for k in val_metrics_accum:
             val_metrics_accum[k] /= max(val_updates, 1)
 
         print(f"Ep {epoch+1} | Train: {avg_train_loss:.4f} | Val: {avg_val_loss:.4f}")
 
         # ------------------------------------------------
-        # [Phase 3] WandB Logging (Requested Format)
+        # [Phase 3] WandB Logging
         # ------------------------------------------------
         log_packet = {
             "Train/Total_Loss": avg_train_loss,
             "Val/Total_Loss": avg_val_loss,
             "LR": optimizer.param_groups[0]["lr"],
             
-            # [LiDAR]
             "Train/loss_lidar": metrics_accum['loss_lidar'],
             "Val/loss_lidar": val_metrics_accum['loss_lidar'],
+            "Train/Total_Loss": avg_train_loss,
 
-            # [Radar 1]
+            "Train/lidar_spatial_loss": metrics_accum['lidar_spatial_loss'],     
+            "Val/lidar_spatial_loss": val_metrics_accum['lidar_spatial_loss'], 
+            
+            "Train/lidar_intensity_loss": metrics_accum['lidar_intensity_loss'], 
+            "Val/lidar_intensity_loss": val_metrics_accum['lidar_intensity_loss'], 
+
             "Train/radar1_loss_total": metrics_accum['radar1_loss_total'],
             "Val/radar1_loss_total": val_metrics_accum['radar1_loss_total'],
             "Train/radar1_loss_temporal": metrics_accum['radar1_loss_temporal'],
@@ -224,7 +216,6 @@ def train():
             "Train/radar1_loss_spatial": metrics_accum['radar1_loss_spatial'],
             "Val/radar1_loss_spatial": val_metrics_accum['radar1_loss_spatial'],
 
-            # [Radar 2]
             "Train/radar2_loss_total": metrics_accum['radar2_loss_total'],
             "Val/radar2_loss_total": val_metrics_accum['radar2_loss_total'],
             "Train/radar2_loss_temporal": metrics_accum['radar2_loss_temporal'],
