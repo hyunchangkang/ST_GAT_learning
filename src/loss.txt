@@ -1,109 +1,384 @@
 import torch
 import torch.nn as nn
 import math
+from torch_scatter import scatter_add
+from torch_cluster import knn_graph, radius
 
-class SelfSupervisedLoss(nn.Module):
 
-    def __init__(self, device, min_sigma_lidar_m=0.02, min_sigma_radar_v=0.1, dist_threshold=1.0):
-        """
-        [Physical Constraints Setup]
-        Accepts physical units (meters, m/s) and converts them to normalized units 
-        used by the network training process.
-        
-        Args:
-            device: torch device
-            min_sigma_lidar_m (float): Minimum physical position uncertainty for LiDAR (Default: 0.1m = 10cm)
-            min_sigma_radar_v (float): Minimum physical velocity uncertainty for Radar (Default: 0.15m/s)
-            dist_threshold (float): Distance threshold for matching (m)
-        """
+class SpatiotemporalUncertaintyLoss(nn.Module):
+    def __init__(self, device, config, penalty_weight=2.0):
         super().__init__()
         self.device = device
-        self.dist_threshold = dist_threshold
-        
-        # --- [Hardcoded Scale Factors from dataset.py] ---
-        # Ensure these match the scaling factors in SingleSequenceDataset!
-        SCALE_POSE = 10.0      # LiDAR Position Scaling
-        SCALE_RADAR_V = 5.0    # Radar Velocity Scaling
+        self.config = config
 
-        # --- [Conversion: Physical -> Normalized] ---
-        # The network predicts normalized values, so we clamp using normalized thresholds.
-        self.min_sig_l = min_sigma_lidar_m / SCALE_POSE  # e.g., 0.1m / 10.0 = 0.01
-        self.min_sig_r = min_sigma_radar_v / SCALE_RADAR_V # e.g., 0.15m/s / 5.0 = 0.03
+        # Scaling Factors (Matching dataset.py)
+        self.SCALE_POSE = 10.0
+        self.SCALE_RADAR_V = 5.0
 
-    def forward(self, mu_l, log_l, gt_l, mu_r1, log_r1, gt_r1, pos_r1, mu_r2, log_r2, gt_r2, pos_r2):
-        # 1. Individual sensor loss calculations (Same as original)
-        l_l, n_l = self._lidar_loss(mu_l, log_l, gt_l)
-        l_r1, n_r1 = self._radar_loss(mu_r1, log_r1, gt_r1, pos_r1)
-        l_r2, n_r2 = self._radar_loss(mu_r2, log_r2, gt_r2, pos_r2)
+        # [Config] Master Weights
+        self.w_lidar = float(config.get('lambda_lidar_loss', 1.0))
+        self.w_radar = float(config.get('lambda_radar_loss', 1.0))
 
-        # 2. Original Weights: 0.5, 0.25, 0.25
-        w_l, w_r1, w_r2 = 0.5, 0.25, 0.25
-        
+        # [Config] LiDAR Decomposed Weights
+        self.w_l_spatial = float(config.get('lambda_lidar_spatial_loss', 1.0))
+        self.w_l_temporal = float(config.get('lambda_lidar_temporal_loss', 1.0))
+        self.w_l_intensity = float(config.get('lambda_lidar_intensity_loss', 1.0))
+
+        # [Config] Radar Component Weights
+        self.w_r_temp = float(config.get('lambda_radar_temporal_loss', 1.0))
+        self.w_r_spat = float(config.get('lambda_radar_spatial_loss', 1.0))
+
+        # [Config] KNN Parameters
+        self.K_LIDAR = int(config.get('k_neighbors_lidar', 5))
+        self.K_RADAR = int(config.get('k_neighbors_radar', 10))
+
+        # [Config] Search Parameters (scaled)
+        self.radius_ll = float(config.get('radius_ll', 0.15)) / self.SCALE_POSE
+        self.temporal_radius = float(config.get('temporal_radius_ll', 0.15)) / self.SCALE_POSE
+        self.radius_cross = float(config.get('radius_cross', 0.6)) / self.SCALE_POSE
+
+        # [Config] Adaptive Radius Fill (Radar-LiDAR assignment)
+        self.r_assign0 = float(config.get('radius_assign0', self.radius_cross))
+        self.r_assign_max = float(config.get('radius_assign_max', 2.0)) / self.SCALE_POSE
+        self.r_assign_grow = float(config.get('radius_assign_grow', 1.6))
+        self.r_assign_max_it = int(config.get('radius_assign_max_it', 6))
+
+        # [Clamping] Aleatoric uncertainty limits
+        min_l = float(config.get('min_sigma_lidar_m', 0.03))
+        max_l = float(config.get('max_sigma_lidar_m', 0.5))
+        self.L_MIN = 2 * math.log(min_l / self.SCALE_POSE + 1e-9)
+        self.L_MAX = 2 * math.log(max_l / self.SCALE_POSE + 1e-9)
+
+        min_r = float(config.get('min_sigma_radar_v', 0.05))
+        max_r = float(config.get('max_sigma_radar_v', 2.0))
+        self.R_MIN = 2 * math.log(min_r / self.SCALE_RADAR_V + 1e-9)
+        self.R_MAX = 2 * math.log(max_r / self.SCALE_RADAR_V + 1e-9)
+
+        # [Penalty / Padding]
+        self.LIDAR_PENALTY_VAL = float(config.get('lidar_penalty_val', 0.2)) ** 2 / (self.SCALE_POSE ** 2)
+        self.GHOST_PENALTY_VAL = float(config.get('ghost_penalty_val', 1.0)) ** 2 / (self.SCALE_POSE ** 2)
+
+        self.penalty_weight = penalty_weight
+
+    def forward(self, outputs, batch, edge_index_dict):
         total_loss = 0.0
-        has_loss = False
-        
-        if n_l > 0:
-            total_loss += w_l * l_l
-            has_loss = True
-        if n_r1 > 0:
-            total_loss += w_r1 * l_r1
-            has_loss = True
-        if n_r2 > 0:
-            total_loss += w_r2 * l_r2
-            has_loss = True
+        log_metrics = {}
 
-        if not has_loss:
-            return torch.tensor(0.0, device=self.device, requires_grad=True), l_l, l_r1, l_r2
+        # -------------------------
+        # Part 1: LiDAR Loss
+        # -------------------------
+        if 'lidar' in batch.node_types and batch['lidar'].x.size(0) > 0:
+            curr_pos = batch['lidar'].pos.to(self.device)
+            curr_int = batch['lidar'].x[:, 2:3].to(self.device)
+            lidar_batch = batch['lidar'].batch.to(self.device).long()
+
+            log_var_pos = torch.clamp(outputs['lidar'], min=self.L_MIN, max=self.L_MAX).to(self.device)
+
+            num_nodes = curr_pos.size(0)
+            precision = torch.exp(-log_var_pos)
+
+            dt_lidar = batch['lidar'].x[:, -1].to(self.device)
+            curr_mask = (dt_lidar.abs() < 0.05)
+
+            # Safety: clamp K by minimum node count per graph in the batch
+            binc = torch.bincount(lidar_batch)
+            if binc.numel() == 0:
+                return torch.tensor(0.0, device=self.device), log_metrics
+
+            min_nodes_in_batch = int(binc.min().item())
+            k_eff = min(self.K_LIDAR, min_nodes_in_batch)
+            if k_eff < 1:
+                return torch.tensor(0.0, device=self.device), log_metrics
+
+            edge_index_l = knn_graph(curr_pos, k=k_eff, batch=lidar_batch, loop=True)
+            src, dst = edge_index_l[0], edge_index_l[1]
+
+            counts_l = scatter_add(torch.ones_like(src).float(), dst, dim=0, dim_size=num_nodes).unsqueeze(1)
+
+            sum_pos = scatter_add(curr_pos[src], dst, dim=0, dim_size=num_nodes)
+            sum_int = scatter_add(curr_int[src], dst, dim=0, dim_size=num_nodes)
+
+            mean_pos = (sum_pos + (k_eff - counts_l) * curr_pos) / float(k_eff)
+            mean_int = (sum_int + (k_eff - counts_l) * curr_int) / float(k_eff)
+
+            res_spatial_raw = torch.sum((curr_pos - mean_pos) ** 2, dim=1, keepdim=True)
+            res_spatial = (res_spatial_raw * counts_l + (k_eff - counts_l) * self.LIDAR_PENALTY_VAL) / float(k_eff)
+            res_int = (curr_int - mean_int) ** 2
+
+            dist_sq = torch.sum((curr_pos[src] - mean_pos[dst]) ** 2, dim=1)
+            sum_dist_sq = scatter_add(dist_sq, dst, dim=0, dim_size=num_nodes).unsqueeze(1)
+            s_t = torch.sqrt((sum_dist_sq + (k_eff - counts_l) * self.LIDAR_PENALTY_VAL) / float(k_eff) + 1e-8)
+
+            # Temporal Consistency (kept)
+            res_temporal = torch.zeros((num_nodes, 1), device=self.device)
+            if curr_mask.any() and 'gt_lidar' in batch.node_types and batch['gt_lidar'].pos.size(0) > 0:
+                p_gt = batch['gt_lidar'].pos.to(self.device)
+                batch_gt = batch['gt_lidar'].batch.to(self.device).long()
+
+                gt_binc = torch.bincount(batch_gt)
+                min_gt = int(gt_binc.min().item()) if gt_binc.numel() > 0 else 0
+                k_gt = min(k_eff, min_gt) if min_gt > 0 else 0
+
+                if k_gt >= 1:
+                    edge_gt = knn_graph(p_gt, k=k_gt, batch=batch_gt, loop=True)
+                    src_g, dst_g = edge_gt[0], edge_gt[1]
+
+                    counts_g = scatter_add(torch.ones_like(src_g).float(), dst_g, dim=0, dim_size=p_gt.size(0)).unsqueeze(1)
+                    mu_gt = (scatter_add(p_gt[src_g], dst_g, dim=0, dim_size=p_gt.size(0)) + (k_gt - counts_g) * p_gt) / float(k_gt)
+
+                    dist_sq_g = torch.sum((p_gt[src_g] - mu_gt[dst_g]) ** 2, dim=1)
+                    s_gt = torch.sqrt(
+                        (scatter_add(dist_sq_g, dst_g, dim=0, dim_size=p_gt.size(0)).unsqueeze(1) +
+                         (k_gt - counts_g) * self.LIDAR_PENALTY_VAL) / float(k_gt) + 1e-8
+                    )
+
+                    mask_indices = torch.where(curr_mask)[0]
+                    batch_idx_t = lidar_batch[curr_mask]
+                    for b_id in torch.unique(batch_idx_t):
+                        m_t = (batch_idx_t == b_id)
+                        m_gt = (batch_gt == b_id)
+                        if m_t.any() and m_gt.any():
+                            d_mat = torch.cdist(mean_pos[mask_indices[m_t]], mu_gt[m_gt])
+                            min_dist, min_idx = torch.min(d_mat, dim=1)
+                            valid = (min_dist < self.temporal_radius)
+                            if valid.any():
+                                res_temporal[mask_indices[m_t][valid]] = (s_t[mask_indices[m_t][valid]] - s_gt[m_gt][min_idx[valid]]) ** 2
+
+            if curr_mask.any():
+                l_spat_term = torch.mean(0.5 * precision[curr_mask] * res_spatial[curr_mask])
+                l_int_term = torch.mean(0.5 * precision[curr_mask] * res_int[curr_mask])
+                l_temp_term = torch.mean(0.5 * precision[curr_mask] * res_temporal[curr_mask])
+                l_reg_term = torch.mean(0.5 * log_var_pos[curr_mask])
+
+                final_l_loss = (
+                    (self.w_l_spatial * l_spat_term) +
+                    (self.w_l_temporal * l_temp_term) +
+                    (self.w_l_intensity * l_int_term) +
+                    l_reg_term
+                ) * self.w_lidar
+
+                total_loss = total_loss + final_l_loss
+
+                log_metrics.update({
+                    'loss_lidar': float(final_l_loss.item()),
+                    'lidar_spatial_loss': float((l_spat_term * self.w_l_spatial * self.w_lidar).item()),
+                    'lidar_temporal_loss': float((l_temp_term * self.w_l_temporal * self.w_lidar).item()),
+                    'lidar_intensity_loss': float((l_int_term * self.w_l_intensity * self.w_lidar).item()),
+                    'lidar_sigma_mean': float(torch.exp(0.5 * log_var_pos).mean().item())
+                })
+
+        # -------------------------
+        # Part 2: Radar Loss
+        # -------------------------
+        # for r_key in ['radar1', 'radar2']:
+        #     if r_key not in batch.node_types or batch[r_key].x.size(0) == 0:
+        #         continue
+
+        #     curr_pos = batch[r_key].pos.to(self.device)
+        #     curr_batch = batch[r_key].batch.to(self.device).long()
+        #     log_var_vel = torch.clamp(outputs[r_key], min=self.R_MIN, max=self.R_MAX).to(self.device)
+
+        #     node_dt = batch['dt_sec'][curr_batch].unsqueeze(1).to(self.device).clamp(min=0.01)
+
+        #     # (1) Temporal/physics error (kept)
+        #     physics_err_sq = torch.zeros_like(log_var_vel)
+        #     temp_edge_key = (r_key, 'temporal', r_key)
+        #     if temp_edge_key in edge_index_dict:
+        #         e_idx = edge_index_dict[temp_edge_key].to(self.device)
+        #         src, dst = e_idx[0], e_idx[1]
+
+        #         move_vec = curr_pos[dst] - curr_pos[src]
+        #         unit_vec = move_vec / (torch.norm(move_vec, dim=1, keepdim=True) + 1e-9)
+
+        #         speed_t = torch.abs(batch[r_key].x[src, 2:3].to(self.device))
+        #         pred_pos_next = curr_pos[src] + (speed_t * unit_vec * node_dt[src])
+
+        #         if 'gt_radar' in batch.node_types and batch['gt_radar'].pos.size(0) > 0:
+        #             gt_radar_pos = batch['gt_radar'].pos.to(self.device)
+        #             min_d, _ = torch.min(torch.cdist(pred_pos_next, gt_radar_pos), dim=1, keepdim=True)
+        #             physics_err_sq[src] = min_d ** 2
+
+        #     # (2) Spatial assignment error (Adaptive radius fill to K) - CORRECTED edge meaning
+        #     spatial_err_sq = torch.ones_like(log_var_vel) * self.GHOST_PENALTY_VAL
+
+        #     if 'lidar' in batch.node_types and batch['lidar'].pos.size(0) > 0:
+        #         lidar_pos = batch['lidar'].pos.to(self.device)
+        #         lidar_batch = batch['lidar'].batch.to(self.device).long()
+
+        #         radar_pos = curr_pos
+        #         radar_batch = curr_batch
+
+        #         K = int(self.K_RADAR)
+        #         Nr = radar_pos.size(0)
+
+        #         # Accumulate candidate pairs across expansions
+        #         cand_dst_r = []
+        #         cand_dist_sq = []
+
+        #         counts_r_long = torch.zeros(Nr, device=self.device, dtype=torch.long)
+        #         active = torch.ones(Nr, device=self.device, dtype=torch.bool)
+
+        #         r_now = float(self.r_assign0)
+
+        #         for _ in range(int(self.r_assign_max_it)):
+        #             if not active.any():
+        #                 break
+
+        #             active_idx = torch.nonzero(active, as_tuple=False).view(-1)
+        #             y = radar_pos[active_idx]
+        #             yb = radar_batch[active_idx]
+
+        #             # IMPORTANT:
+        #             # torch_cluster.radius(x, y) returns:
+        #             # edge[0] -> index in y
+        #             # edge[1] -> index in x
+        #             edge = radius(
+        #                 x=lidar_pos,
+        #                 y=y,
+        #                 r=r_now,
+        #                 batch_x=lidar_batch,
+        #                 batch_y=yb,
+        #                 max_num_neighbors=K
+        #             )
+
+        #             if edge.numel() > 0:
+        #                 dst_local = edge[0]  # y index (local radar index in y)
+        #                 src_l = edge[1]      # x index (lidar index)
+
+        #                 # Range check for dst_local (must be within y.size(0))
+        #                 if (dst_local.min() < 0) or (dst_local.max() >= y.size(0)):
+        #                     raise RuntimeError(
+        #                         f"[radius] dst_local out of range: "
+        #                         f"min={int(dst_local.min().item())}, max={int(dst_local.max().item())}, y_size={y.size(0)}"
+        #                     )
+
+        #                 # local radar -> global radar index
+        #                 dst_r = active_idx[dst_local]
+
+        #                 # Range check for dst_r (must be within Nr)
+        #                 if (dst_r.min() < 0) or (dst_r.max() >= Nr):
+        #                     raise RuntimeError(
+        #                         f"[radius] dst_r out of range: "
+        #                         f"min={int(dst_r.min().item())}, max={int(dst_r.max().item())}, Nr={Nr}"
+        #                     )
+
+        #                 # Compute dist^2 (radar point vs lidar point)
+        #                 d = radar_pos[dst_r] - lidar_pos[src_l]
+        #                 dist_sq = torch.sum(d * d, dim=1)
+
+        #                 cand_dst_r.append(dst_r)
+        #                 cand_dist_sq.append(dist_sq)
+
+        #                 # Safe counting (index_add)
+        #                 add = torch.zeros(Nr, device=self.device, dtype=torch.long)
+        #                 ones = torch.ones_like(dst_r, dtype=torch.long)
+        #                 add.index_add_(0, dst_r, ones)
+        #                 counts_r_long = counts_r_long + add
+
+        #                 active = counts_r_long < K
+
+        #             r_now = min(r_now * float(self.r_assign_grow), float(self.r_assign_max))
+
+        #         if len(cand_dst_r) > 0:
+        #             dst_r_all = torch.cat(cand_dst_r)
+        #             dist_sq_all = torch.cat(cand_dist_sq)
+
+        #             sum_d = torch.zeros((Nr, 1), device=self.device)
+        #             counts_r = torch.zeros((Nr, 1), device=self.device)
+
+        #             unique_r = torch.unique(dst_r_all)
+        #             for rid in unique_r.tolist():
+        #                 m = (dst_r_all == rid)
+        #                 ds = dist_sq_all[m]
+        #                 if ds.numel() == 0:
+        #                     continue
+
+        #                 if ds.numel() > K:
+        #                     topk_vals, _ = torch.topk(ds, k=K, largest=False)
+        #                     ds_use = topk_vals
+        #                     c = K
+        #                 else:
+        #                     ds_use = ds
+        #                     c = int(ds.numel())
+
+        #                 sum_d[rid, 0] = ds_use.sum()
+        #                 counts_r[rid, 0] = float(c)
+
+        #             spatial_err_sq = (sum_d + (K - counts_r).clamp(min=0) * self.GHOST_PENALTY_VAL) / float(K)
+
+        #     # (3) Radar NLL-like form (kept)
+        #     denominator = 2 * torch.exp(log_var_vel) * (node_dt ** 2) + 1e-9
+
+        #     r_temp_loss = torch.mean(physics_err_sq / denominator)
+        #     r_spat_loss = torch.mean(spatial_err_sq / denominator)
+        #     r_reg_loss = torch.mean(0.5 * log_var_vel)
+
+        #     final_r_loss = (
+        #         (self.w_r_temp * r_temp_loss) +
+        #         (self.w_r_spat * r_spat_loss) +
+        #         r_reg_loss
+        #     ) * self.w_radar
+
+        #     total_loss = total_loss + final_r_loss
+
+        #     log_metrics.update({
+        #         f'{r_key}_loss_total': float(final_r_loss.item()),
+        #         f'{r_key}_loss_temporal': float((r_temp_loss * self.w_r_temp * self.w_radar).item()),
+        #         f'{r_key}_loss_spatial': float((r_spat_loss * self.w_r_spat * self.w_radar).item()),
+        #         f'{r_key}_sigma_mean': float(torch.exp(0.5 * log_var_vel).mean().item())
+        #     })
+
+        for r_key in ['radar1', 'radar2']:
+            if r_key not in batch.node_types or batch[r_key].x.size(0) == 0: continue
             
-        return total_loss, l_l, l_r1, l_r2
+            log_var_vel = torch.clamp(outputs[r_key], min=self.R_MIN, max=self.R_MAX)
+            curr_pos, curr_batch = batch[r_key].pos, batch[r_key].batch
+            node_dt = batch['dt_sec'][curr_batch].unsqueeze(1).clamp(min=0.01)
+            
+            # [A] Temporal Prediction (t -> t+1)
+            physics_err_sq = torch.zeros_like(log_var_vel)
+            temp_edge_key = (r_key, 'temporal', r_key)
+            if temp_edge_key in edge_index_dict:
+                e_idx = edge_index_dict[temp_edge_key]
+                src, dst = e_idx[0], e_idx[1]
+                # Direction unit vector from t to t+1
+                move_vec = curr_pos[dst] - curr_pos[src]
+                unit_vec = move_vec / (torch.norm(move_vec, dim=1, keepdim=True) + 1e-9)
+                # Prediction using Doppler speed at t
+                speed_t = torch.abs(batch[r_key].x[src, 2:3])
+                pred_pos_next = curr_pos[src] + (speed_t * unit_vec * node_dt[src])
+                
+                if 'gt_radar' in batch.node_types and batch['gt_radar'].pos.size(0) > 0:
+                    d_mat = torch.cdist(pred_pos_next, batch['gt_radar'].pos)
+                    min_d, _ = torch.min(d_mat, dim=1, keepdim=True)
+                    physics_err_sq[src] = min_d ** 2
 
-    def _lidar_loss(self, mu, log_v, gt):
-        """
-        Original LiDAR spatial distance loss with new sigma clamping.
-        """
-        if mu.size(0) == 0 or gt.size(0) == 0: 
-            return torch.tensor(0.0, device=self.device, requires_grad=True), 0
-        
-        # [Modified] Clamp sigma based on physical value
-        sigma = torch.exp(0.5 * log_v)
-        sigma = torch.clamp(sigma, min=self.min_sig_l)
-        valid_log_v = 2 * torch.log(sigma)
-        
-        d = torch.cdist(mu, gt)
-        min_d, _ = torch.min(d, dim=1)
-        
-        # Original distance filtering
-        mask = min_d < self.dist_threshold
-        if not mask.any(): 
-            return torch.tensor(0.0, device=self.device, requires_grad=True), 0
-        
-        v_log_v = valid_log_v[mask]
-        # Predictive NLL formula
-        loss = (0.5 * torch.exp(-v_log_v) * (min_d[mask]**2) + 0.5 * v_log_v).mean()
-        return loss, mask.sum().item()
+            # [B] Spatial consistency (Ghost filtering)
+            spatial_err_sq = torch.ones_like(log_var_vel) * self.GHOST_PENALTY_VAL
+            edge_key_l = (r_key, 'to', 'lidar')
+            if edge_key_l in edge_index_dict and batch['lidar'].pos.size(0) > 0:
+                e_idx = edge_index_dict[edge_key_l]
+                src_r, dst_l = e_idx[0], e_idx[1]
+                dist_sq = torch.sum((curr_pos[src_r] - batch['lidar'].pos[dst_l])**2, dim=1)
+                sum_d = scatter_add(dist_sq, src_r, dim=0, dim_size=curr_pos.size(0))
+                cnt_d = scatter_add(torch.ones_like(dist_sq), src_r, dim=0, dim_size=curr_pos.size(0))
+                has_n = (cnt_d > 0)
+                spatial_err_sq[has_n] = (sum_d[has_n] / (cnt_d[has_n]**2)).unsqueeze(1)
 
-    def _radar_loss(self, mu, log_v, gt, pos):
-        """
-        Original Radar velocity error loss with new sigma clamping.
-        """
-        if mu.size(0) == 0 or gt.size(0) == 0: 
-            return torch.tensor(0.0, device=self.device, requires_grad=True), 0
-        
-        # [Modified] Clamp sigma based on physical value
-        sigma = torch.exp(0.5 * log_v)
-        sigma = torch.clamp(sigma, min=self.min_sig_r)
-        valid_log_v = 2 * torch.log(sigma)
-        
-        # Original anchor-based matching
-        d = torch.cdist(pos, gt[:, :2])
-        min_d, idx = torch.min(d, dim=1)
-        
-        mask = min_d < self.dist_threshold
-        if not mask.any(): 
-            return torch.tensor(0.0, device=self.device, requires_grad=True), 0
-        
-        matched_gt_v = gt[idx[mask], 2].unsqueeze(1)
-        err = (mu[mask] - matched_gt_v)**2
-        v_log_v = valid_log_v[mask]
-        loss = (0.5 * torch.exp(-v_log_v) * err + 0.5 * v_log_v).mean()
-        return loss, mask.sum().item()
+            # [C] Integration
+            denominator = 2 * torch.exp(log_var_vel) * (node_dt ** 2) + 1e-9
+            r_temp_loss = torch.mean(physics_err_sq / denominator)
+            r_spat_loss = torch.mean(spatial_err_sq / denominator)
+            r_reg_loss = torch.mean(0.5 * log_var_vel)
+            
+            final_r_loss = ( (self.w_r_temp * r_temp_loss) + 
+                             (self.w_r_spat * r_spat_loss) + 
+                             r_reg_loss ) * self.w_radar
+            
+            total_loss += final_r_loss
+            log_metrics[f'{r_key}_loss_total'] = final_r_loss.item()
+            log_metrics[f'{r_key}_loss_temporal'] = (r_temp_loss * self.w_r_temp * self.w_radar).item()
+            log_metrics[f'{r_key}_loss_spatial'] = (r_spat_loss * self.w_r_spat * self.w_radar).item()
+            log_metrics[f'{r_key}_sigma_mean'] = torch.exp(0.5 * log_var_vel).mean().item()
+
+        return total_loss, log_metrics

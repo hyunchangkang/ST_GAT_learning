@@ -55,7 +55,7 @@ val_versions:
   # - "v3"
   - "v11"
 
-inference_version: "v11"
+inference_version: "v8"
 
 model_path: "output/best_model.pth"  
 
@@ -94,8 +94,8 @@ lambda_lidar_loss: 1.0
 lambda_radar_loss: 1.0
 
 lambda_lidar_temporal_loss: 1.0
-lambda_lidar_intensity_loss: 0.05
-lambda_lidar_spatial_loss: 0.05
+lambda_lidar_intensity_loss: 0.2
+lambda_lidar_spatial_loss: 0.02
 
 lambda_radar_temporal_loss: 1.0
 lambda_radar_spatial_loss: 1.0

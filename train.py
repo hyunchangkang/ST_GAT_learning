@@ -36,8 +36,8 @@ def train():
     print(f"[Train] Mode: LiDAR(Anchor) + Radar(Physics-Consistency Sigma)")
 
     # WandB Init
-    wandb.init(project="SensorFusion_Final", config=cfg)
-    wandb.run.name = f"PhysicsLoss_{cfg['train_versions']}"
+    wandb.init(project="ST_learning_v3", config=cfg)
+    wandb.run.name = f"NewLoss_v3{cfg['train_versions']}"
 
     # ====================================================
     # 2. Dataset Setup
@@ -127,8 +127,12 @@ def train():
             'loss_lidar': 0.0,
             'lidar_spatial_loss': 0.0,   
             'lidar_intensity_loss': 0.0, 
+            'lidar_temporal_loss': 0.0,
             'radar1_loss_total': 0.0, 'radar1_loss_temporal': 0.0, 'radar1_loss_spatial': 0.0,
-            'radar2_loss_total': 0.0, 'radar2_loss_temporal': 0.0, 'radar2_loss_spatial': 0.0
+            'radar2_loss_total': 0.0, 'radar2_loss_temporal': 0.0, 'radar2_loss_spatial': 0.0,
+            'lidar_sigma_mean': 0.0,
+            'radar1_sigma_mean': 0.0,
+            'radar2_sigma_mean': 0.0,
         }
 
         loop = tqdm(train_loader, desc=f"[Train] Epoch {epoch+1}")
@@ -199,29 +203,42 @@ def train():
             "Val/Total_Loss": avg_val_loss,
             "LR": optimizer.param_groups[0]["lr"],
             
-            "Train/loss_lidar": metrics_accum['loss_lidar'],
-            "Val/loss_lidar": val_metrics_accum['loss_lidar'],
-            "Train/Total_Loss": avg_train_loss,
+            # LiDAR metrics
+            "Train/LiDAR_loss": metrics_accum['loss_lidar'],
+            "Val/LiDAR_loss": val_metrics_accum['loss_lidar'],
+            "Train/LiDAR_spatial_loss": metrics_accum['lidar_spatial_loss'],     
+            "Val/LiDAR_spatial_loss": val_metrics_accum['lidar_spatial_loss'], 
+            "Train/LiDAR_temporal_loss": metrics_accum['lidar_temporal_loss'],     
+            "Val/LiDAR_temporal_loss": val_metrics_accum['lidar_temporal_loss'], 
+            "Train/LiDAR_intensity_loss": metrics_accum['lidar_intensity_loss'], 
+            "Val/LiDAR_intensity_loss": val_metrics_accum['lidar_intensity_loss'], 
 
-            "Train/lidar_spatial_loss": metrics_accum['lidar_spatial_loss'],     
-            "Val/lidar_spatial_loss": val_metrics_accum['lidar_spatial_loss'], 
-            
-            "Train/lidar_intensity_loss": metrics_accum['lidar_intensity_loss'], 
-            "Val/lidar_intensity_loss": val_metrics_accum['lidar_intensity_loss'], 
+            # Radar1 metrics
+            "Train/Radar1_loss_total": metrics_accum['radar1_loss_total'],
+            "Val/Radar1_loss_total": val_metrics_accum['radar1_loss_total'],
+            "Train/Radar1_loss_temporal": metrics_accum['radar1_loss_temporal'],
+            "Val/Radar1_loss_temporal": val_metrics_accum['radar1_loss_temporal'],
+            "Train/Radar1_loss_spatial": metrics_accum['radar1_loss_spatial'],
+            "Val/Radar1_loss_spatial": val_metrics_accum['radar1_loss_spatial'],
 
-            "Train/radar1_loss_total": metrics_accum['radar1_loss_total'],
-            "Val/radar1_loss_total": val_metrics_accum['radar1_loss_total'],
-            "Train/radar1_loss_temporal": metrics_accum['radar1_loss_temporal'],
-            "Val/radar1_loss_temporal": val_metrics_accum['radar1_loss_temporal'],
-            "Train/radar1_loss_spatial": metrics_accum['radar1_loss_spatial'],
-            "Val/radar1_loss_spatial": val_metrics_accum['radar1_loss_spatial'],
+            # Radar2 metrics
+            "Train/Radar2_loss_total": metrics_accum['radar2_loss_total'],
+            "Val/Radar2_loss_total": val_metrics_accum['radar2_loss_total'],
+            "Train/Radar2_loss_temporal": metrics_accum['radar2_loss_temporal'],
+            "Val/Radar2_loss_temporal": val_metrics_accum['radar2_loss_temporal'],
+            "Train/Radar2_loss_spatial": metrics_accum['radar2_loss_spatial'],
+            "Val/Radar2_loss_spatial": val_metrics_accum['radar2_loss_spatial'],
 
-            "Train/radar2_loss_total": metrics_accum['radar2_loss_total'],
-            "Val/radar2_loss_total": val_metrics_accum['radar2_loss_total'],
-            "Train/radar2_loss_temporal": metrics_accum['radar2_loss_temporal'],
-            "Val/radar2_loss_temporal": val_metrics_accum['radar2_loss_temporal'],
-            "Train/radar2_loss_spatial": metrics_accum['radar2_loss_spatial'],
-            "Val/radar2_loss_spatial": val_metrics_accum['radar2_loss_spatial'],
+            "Train/LiDAR_sigma_mean_scaled": metrics_accum['lidar_sigma_mean'],
+            "Val/LiDAR_sigma_mean_scaled": val_metrics_accum['lidar_sigma_mean'],
+            "Train/LiDAR_sigma_mean_m": metrics_accum['lidar_sigma_mean'] * 10.0,
+            "Val/LiDAR_sigma_mean_m": val_metrics_accum['lidar_sigma_mean'] * 10.0,
+
+            "Train/Radar1_sigma_mean_mps": metrics_accum['radar1_sigma_mean'] * 5.0,
+            "Val/Radar1_sigma_mean_mps": val_metrics_accum['radar1_sigma_mean'] * 5.0,
+            "Train/Radar2_sigma_mean_mps": metrics_accum['radar2_sigma_mean'] * 5.0,
+            "Val/Radar2_sigma_mean_mps": val_metrics_accum['radar2_sigma_mean'] * 5.0,
+
         }
         
         wandb.log(log_packet, step=epoch)
@@ -239,9 +256,18 @@ def train():
         else:
             counter += 1
             print(f"[!] No Improvement. Patience: {counter}/{patience}")
-            if counter >= patience:
-                print("Early Stopping")
-                break
+
+        save_interval = int(cfg.get("save_interval", 10))
+
+        if (epoch + 1) % save_interval == 0:
+            filename = f"model_epoch_{epoch+1}.pth"
+            save_path = os.path.join(cfg["save_dir"], filename)
+            torch.save(model.state_dict(), save_path)
+            print(f"[+] Periodic Checkpoint Saved: {filename}")
+
+        if counter >= patience:
+            print("Early Stopping")
+            break
 
     wandb.finish()
 
